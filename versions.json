@@ -1,0 +1,6 @@
+{
+  "image": "MiniMax-H3 FL2VA on 4x K100-AI (gfx928), DTK 25.04.2",
+  "repos": "InfiniCore / InfiniLM / ninetoothed: branch k100 = upstream + one snapshot commit",
+  "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+  "diffusers": "e0abab83b5df05de9e7abd788643c1a7c1e42e28"
+}

@@ -1,0 +1,8 @@
+{
+  "block_m": 128,
+  "block_n": 32,
+  "num_warps": 4,
+  "num_stages": 1,
+  "numerics": "fp32_qk",
+  "backend_options": {}
+}

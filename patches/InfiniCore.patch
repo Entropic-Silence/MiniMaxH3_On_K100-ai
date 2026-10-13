@@ -1,0 +1,3067 @@
+diff --git a/include/infinicore/graph/graph.hpp b/include/infinicore/graph/graph.hpp
+index b74ad862..ce0f8179 100644
+--- a/include/infinicore/graph/graph.hpp
++++ b/include/infinicore/graph/graph.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "../ops/distributed/collective_sync.hpp"
+ #include <cstdint>
+ #include <memory>
+ #include <unordered_map>
+@@ -154,6 +155,7 @@ const std::vector<int64_t> *lookup_bound_host_int_array(const Tensor &tensor);
+     if (context::isGraphRecording()) {                       \
+         context::addGraphOperator(___op);                    \
+     } else {                                                 \
++        ::infinicore::op::distributed::FirstForwardLaunchGuard ___guard; \
+         ___op->run();                                        \
+     }                                                        \
+     _INFINICORE_TRACE_OP(__OP_NAME__, INFINICORE_DETAIL_FIRST_ARG(__VA_ARGS__));
+diff --git a/include/infinicore/ops.hpp b/include/infinicore/ops.hpp
+index 5e93e145..1d794ee2 100644
+--- a/include/infinicore/ops.hpp
++++ b/include/infinicore/ops.hpp
+@@ -90,6 +90,7 @@
+ #include "ops/swap.hpp"
+ #include "ops/swiglu.hpp"
+ #include "ops/tanh.hpp"
++#include "ops/timestep_embedding.hpp"
+ #include "ops/topksoftmax.hpp"
+ #include "ops/vocab_parallel_embedding.hpp"
+ #include "ops/zeros.hpp"
+diff --git a/include/infinicore/ops/distributed/all_to_all.hpp b/include/infinicore/ops/distributed/all_to_all.hpp
+new file mode 100644
+index 00000000..eb6fd4ae
+--- /dev/null
++++ b/include/infinicore/ops/distributed/all_to_all.hpp
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include "../../device.hpp"
++#include "../../tensor.hpp"
++
++#include <infiniccl.h>
++#include <infinirt.h>
++
++namespace infinicore::op::distributed {
++
++// Equal-split all-to-all along dim 0. `input` and `output` are contiguous with
++// the same shape and dtype, and dim 0 is a multiple of `world_size`: the p-th
++// block of `input` is sent to rank p, and the q-th block of `output` receives
++// rank q's block for this rank. Built from grouped point-to-point transfers;
++// the block for this rank is copied locally.
++void all_to_all_(Tensor output, const Tensor &input, int rank, int world_size,
++                 infinicclComm_t communicator);
++
++// Same, issued on `stream` instead of the current runtime stream so it can
++// overlap computation; the caller orders producers and consumers with events
++// and keeps both tensors alive until the consumer has waited.
++void all_to_all_on_stream_(Tensor output, const Tensor &input, int rank, int world_size,
++                           infinicclComm_t communicator, infinirtStream_t stream);
++
++// One grouped point-to-point step on `stream`: `send` goes to rank
++// `send_peer` while `recv` is filled from rank `recv_peer` (both contiguous,
++// same dtype). A rank sequence where every rank sends to (rank + k) and
++// receives from (rank - k) in step k pairs up without deadlock; used to return
++// attention outputs destination by destination as soon as each is computed.
++void send_recv_on_stream_(const Tensor &send, int send_peer, Tensor recv, int recv_peer,
++                          infinicclComm_t communicator, infinirtStream_t stream);
++
++} // namespace infinicore::op::distributed
+diff --git a/include/infinicore/ops/distributed/allreduce.hpp b/include/infinicore/ops/distributed/allreduce.hpp
+index 39f74243..7e6489ff 100644
+--- a/include/infinicore/ops/distributed/allreduce.hpp
++++ b/include/infinicore/ops/distributed/allreduce.hpp
+@@ -5,6 +5,7 @@
+ #include "../common/op.hpp"
+ 
+ #include <infiniccl.h>
++#include <infinirt.h>
+ 
+ namespace infinicore::op::distributed {
+ class AllReduce : public graph::GraphOperator {
+@@ -21,4 +22,10 @@ private:
+ Tensor allreduce(const Tensor &input, infinicclReduceOp_t op, infinicclComm_t communicator);
+ void allreduce_(Tensor output, const Tensor &input, infinicclReduceOp_t op, infinicclComm_t communicator);
+ 
++// Same, issued on `stream` instead of the current runtime stream so it can
++// overlap computation; the caller orders producers and consumers with events
++// and keeps both tensors alive until the consumer has waited.
++void allreduce_on_stream_(Tensor output, const Tensor &input, infinicclReduceOp_t op,
++                          infinicclComm_t communicator, infinirtStream_t stream);
++
+ } // namespace infinicore::op::distributed
+diff --git a/include/infinicore/ops/distributed/collective_sync.hpp b/include/infinicore/ops/distributed/collective_sync.hpp
+new file mode 100644
+index 00000000..a88da897
+--- /dev/null
++++ b/include/infinicore/ops/distributed/collective_sync.hpp
+@@ -0,0 +1,42 @@
++#pragma once
++
++namespace infinicore::op::distributed {
++
++// Thread-local switch: when enabled, every collective issued by the calling
++// thread waits on its stream until the collective has completed. Engines turn
++// it on for their first (warm-up) forward so that lazily loaded GPU code
++// objects are never uploaded to a device while a collective kernel is still
++// spinning there waiting for peer ranks (observed as a whole-process hang on
++// 4x K100-AI with HIP deferred code-object loading).
++void set_synchronous_collectives(bool enabled);
++bool synchronous_collectives();
++
++// Called by collective operators right after enqueueing the collective.
++void finish_collective();
++
++// While the calling thread is in synchronous-collectives mode (an engine's
++// first forward), operator launches of all such threads are serialized
++// process-wide. The first launches lazily load GPU code objects, and on DTK
++// 25.04.2 loading a code object while another thread launches a kernel can
++// crash the runtime (segfault in hipLaunchKernel at address 0x20, seen in the
++// Qwen3-VL and DiT first forwards). Collectives never hold the lock (they
++// call release_launch_guard() before entering the communication library): on
++// its first use RCCL connects peers inside the enqueue call and blocks until
++// every rank has entered it, so a rank holding the lock there deadlocks the
++// others (seen as a hang in the first DiT all-to-all). Outside first forwards
++// the guard does nothing.
++class FirstForwardLaunchGuard {
++public:
++    FirstForwardLaunchGuard();
++    ~FirstForwardLaunchGuard();
++    FirstForwardLaunchGuard(const FirstForwardLaunchGuard &) = delete;
++    FirstForwardLaunchGuard &operator=(const FirstForwardLaunchGuard &) = delete;
++
++private:
++    bool counted_ = false;
++};
++
++// Releases the calling thread's launch lock early (before a collective).
++void release_launch_guard();
++
++} // namespace infinicore::op::distributed
+diff --git a/include/infinicore/ops/h3_numerics.hpp b/include/infinicore/ops/h3_numerics.hpp
+new file mode 100644
+index 00000000..72fea302
+--- /dev/null
++++ b/include/infinicore/ops/h3_numerics.hpp
+@@ -0,0 +1,38 @@
++#pragma once
++#include "../graph/graph.hpp"
++#include "common/op.hpp"
++#include <utility>
++
++namespace infinicore::op {
++// H3's torch 2.5 reference rounds each RMSNorm intermediate to BF16.
++// Keep this separate from the FP32-accumulating RMSNorm used by Qwen.
++INFINICORE_GRAPH_OP_CLASS(H3RMSNorm, Tensor, const Tensor &, const Tensor &, float);
++INFINICORE_GRAPH_OP_CLASS(H3SwiGLU, Tensor, const Tensor &, const Tensor &);
++INFINICORE_GRAPH_OP_CLASS(H3RMSModulate, Tensor, const Tensor &, const Tensor &, const Tensor &, const Tensor &, float);
++INFINICORE_GRAPH_OP_CLASS(H3RoPE, Tensor, const Tensor &, const Tensor &, const Tensor &);
++// out = x + gate * y with the product and the sum each rounded to BF16.
++INFINICORE_GRAPH_OP_CLASS(H3GatedResidual, Tensor, const Tensor &, const Tensor &, const Tensor &);
++INFINICORE_GRAPH_OP_CLASS(H3QKNormRope, Tensor, const Tensor &, const Tensor &, const Tensor &, const Tensor &, float);
++INFINICORE_GRAPH_OP_CLASS(H3RoPECache, Tensor, const Tensor &, const Tensor &);
++// residual = x + gate * y as above; out = h3_rms_modulate(residual, ...).
++INFINICORE_GRAPH_OP_CLASS(H3GatedResidualRMSModulate, Tensor, Tensor, const Tensor &, const Tensor &, const Tensor &,
++                          const Tensor &, const Tensor &, const Tensor &, float);
++Tensor h3_rms_norm(const Tensor &x, const Tensor &weight, float epsilon);
++Tensor h3_swiglu(const Tensor &up, const Tensor &gate);
++Tensor h3_rms_modulate(const Tensor &x, const Tensor &weight, const Tensor &scale, const Tensor &shift, float epsilon);
++// Angles have already been gathered into token order; each half is repeated.
++Tensor h3_rope(const Tensor &x, const Tensor &cos, const Tensor &sin);
++Tensor h3_gated_residual(const Tensor &x, const Tensor &gate, const Tensor &y);
++// Per-head RMSNorm (weight [128]) then 3-axis RoPE (angles [T, 48]) of
++// x [T, P, Hs, 128] (any strides) written into out [T, P, Hs, 128] (any
++// strides, e.g. a permuted all-to-all send buffer); k100-extreme.
++void h3_qk_norm_rope_(Tensor out, const Tensor &x, const Tensor &weight, const Tensor &cos,
++                      const Tensor &sin, float epsilon);
++// H3's 3-axis RoPE table [T, 96] BF16 = cat(cos, sin) of position [T, 3]
++// (FP64) times 1 / power, power [16] FP32 = theta ** (2k / 32) (float_power).
++Tensor h3_rope_cache(const Tensor &position, const Tensor &power);
++// Returns {residual, modulated}.
++std::pair<Tensor, Tensor> h3_gated_residual_rms_modulate(const Tensor &x, const Tensor &gate, const Tensor &y,
++                                                         const Tensor &weight, const Tensor &scale,
++                                                         const Tensor &shift, float epsilon);
++} // namespace infinicore::op
+diff --git a/include/infinicore/ops/timestep_embedding.hpp b/include/infinicore/ops/timestep_embedding.hpp
+new file mode 100644
+index 00000000..debd6c51
+--- /dev/null
++++ b/include/infinicore/ops/timestep_embedding.hpp
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "../device.hpp"
++#include "../graph/graph.hpp"
++#include "common/op.hpp"
++
++namespace infinicore::op {
++
++INFINICORE_GRAPH_OP_CLASS(TimestepEmbedding, Tensor, const Tensor &, float);
++
++Tensor timestep_embedding(const Tensor &timestep,
++                          size_t embedding_dim = 256,
++                          float max_period = 10000.0f);
++
++void timestep_embedding_(Tensor output,
++                         const Tensor &timestep,
++                         float max_period = 10000.0f);
++
++} // namespace infinicore::op
+diff --git a/include/infiniop.h b/include/infiniop.h
+index 9f632e27..d26e5767 100644
+--- a/include/infiniop.h
++++ b/include/infiniop.h
+@@ -155,6 +155,7 @@
+ #include "infiniop/ops/tan.h"
+ #include "infiniop/ops/tanh.h"
+ #include "infiniop/ops/tanhshrink.h"
++#include "infiniop/ops/timestep_embedding.h"
+ #include "infiniop/ops/topk.h"
+ #include "infiniop/ops/topkrouter.h"
+ #include "infiniop/ops/topksoftmax.h"
+diff --git a/include/infiniop/ops/timestep_embedding.h b/include/infiniop/ops/timestep_embedding.h
+new file mode 100644
+index 00000000..7403c3f6
+--- /dev/null
++++ b/include/infiniop/ops/timestep_embedding.h
+@@ -0,0 +1,24 @@
++#ifndef __INFINIOP_TIMESTEP_EMBEDDING_API_H__
++#define __INFINIOP_TIMESTEP_EMBEDDING_API_H__
++
++#include "../operator_descriptor.h"
++
++typedef struct InfiniopDescriptor *infiniopTimestepEmbeddingDescriptor_t;
++
++__INFINI_C __export infiniStatus_t infiniopCreateTimestepEmbeddingDescriptor(
++    infiniopHandle_t handle,
++    infiniopTimestepEmbeddingDescriptor_t *desc_ptr,
++    infiniopTensorDescriptor_t output_desc,
++    infiniopTensorDescriptor_t timestep_desc);
++
++__INFINI_C __export infiniStatus_t infiniopTimestepEmbedding(
++    infiniopTimestepEmbeddingDescriptor_t desc,
++    void *output,
++    const void *timestep,
++    float max_period,
++    void *stream);
++
++__INFINI_C __export infiniStatus_t infiniopDestroyTimestepEmbeddingDescriptor(
++    infiniopTimestepEmbeddingDescriptor_t desc);
++
++#endif
+diff --git a/python/infinicore/__init__.py b/python/infinicore/__init__.py
+index 612db614..3ffde829 100644
+--- a/python/infinicore/__init__.py
++++ b/python/infinicore/__init__.py
+@@ -20,6 +20,7 @@ from infinicore.context import (
+     stop_graph_recording,
+     sync_device,
+     sync_stream,
++    trim_memory,
+ )
+ from infinicore.device import device
+ from infinicore.device_event import DeviceEvent
+@@ -170,6 +171,7 @@ from infinicore.ops.sum import sum
+ from infinicore.ops.swap import swap
+ from infinicore.ops.take import take
+ from infinicore.ops.tan import tan
++from infinicore.ops.timestep_embedding import timestep_embedding
+ from infinicore.ops.topk import topk
+ from infinicore.ops.unsqueeze import unsqueeze
+ from infinicore.ops.vander import vander
+@@ -280,6 +282,7 @@ __all__ = [
+     "mul",
+     "mul_scalar",
+     "situ_and_mul",
++    "timestep_embedding",
+     "diff",
+     "digamma",
+     "dist",
+diff --git a/python/infinicore/context.py b/python/infinicore/context.py
+index 1181738c..3863047d 100644
+--- a/python/infinicore/context.py
++++ b/python/infinicore/context.py
+@@ -43,6 +43,15 @@ def sync_device():
+     _infinicore.sync_device()
+ 
+ 
++def trim_memory():
++    """Release unused allocator blocks after synchronizing the current device.
++
++    Live tensors and graph-pinned blocks remain allocated.
++    """
++    _infinicore.sync_device()
++    _infinicore.trim_memory()
++
++
+ def get_stream():
+     """Get the current stream.
+ 
+diff --git a/python/infinicore/ops/timestep_embedding.py b/python/infinicore/ops/timestep_embedding.py
+new file mode 100644
+index 00000000..146d12f6
+--- /dev/null
++++ b/python/infinicore/ops/timestep_embedding.py
+@@ -0,0 +1,21 @@
++from infinicore.lib import _infinicore
++from infinicore.tensor import Tensor
++
++
++def timestep_embedding(timestep, embedding_dim=256, max_period=10000.0, *, out=None):
++    max_period = float(max_period)
++    if out is None:
++        return Tensor(
++            _infinicore.timestep_embedding(
++                timestep._underlying,
++                int(embedding_dim),
++                max_period,
++            )
++        )
++
++    _infinicore.timestep_embedding_(
++        out._underlying,
++        timestep._underlying,
++        max_period,
++    )
++    return out
+diff --git a/python/infinicore/tensor.py b/python/infinicore/tensor.py
+index bbe801f9..d10929dc 100644
+--- a/python/infinicore/tensor.py
++++ b/python/infinicore/tensor.py
+@@ -190,7 +190,10 @@ def strided_from_blob(data_ptr, size, strides, *, dtype=None, device=None):
+ 
+ def from_torch(torch_tensor) -> Tensor:
+     infini_type = to_infinicore_dtype(torch_tensor.dtype)
+-    infini_device = infinicore.device(torch_tensor.device.type, 0)
++    device_index = torch_tensor.device.index
++    infini_device = infinicore.device(
++        torch_tensor.device.type, 0 if device_index is None else device_index
++    )
+     return Tensor(
+         _infinicore.from_blob(
+             torch_tensor.data_ptr(),
+diff --git a/python/infinicore/utils.py b/python/infinicore/utils.py
+index 6ef8c1ef..d7ca2b28 100644
+--- a/python/infinicore/utils.py
++++ b/python/infinicore/utils.py
+@@ -41,6 +41,8 @@ def to_infinicore_dtype(torch_dtype):
+     """Convert PyTorch data type to infinicore data type"""
+     if torch_dtype == torch.float32:
+         return infinicore.float32
++    elif torch_dtype == torch.float64:
++        return infinicore.float64
+     elif torch_dtype == torch.float16:
+         return infinicore.float16
+     elif torch_dtype == torch.bfloat16:
+diff --git a/src/infinicore/context/allocators/pinnable_block_allocator.cc b/src/infinicore/context/allocators/pinnable_block_allocator.cc
+index 32e5c5e9..cd285bca 100644
+--- a/src/infinicore/context/allocators/pinnable_block_allocator.cc
++++ b/src/infinicore/context/allocators/pinnable_block_allocator.cc
+@@ -17,21 +17,31 @@ inline size_t align_up(size_t size, size_t alignment) {
+     return (size + alignment - 1) / alignment * alignment;
+ }
+ 
++namespace {
++// Requests above the largest size class are served by exact-size large blocks
++// rounded to this granularity. Power-of-two classes above 32 MB wasted up to
++// half of each block (e.g. 130 MB weight shards occupying 256 MB blocks).
++constexpr size_t LARGE_BLOCK_GRANULARITY = 2 * 1024 * 1024;
++
++// A free large block is reused only when it is not much larger than the
++// request, so a big cached block is not tied up by a small tensor.
++bool acceptable_reuse(size_t block_size, size_t request) {
++    return block_size >= request && block_size - request <= std::max(request / 8, LARGE_BLOCK_GRANULARITY);
++}
++} // namespace
++
+ // ------------------- Constructor -------------------
+ PinnableBlockAllocator::PinnableBlockAllocator(Device device)
+     : device_(device) {
+     size_classes_ = {
+-        {32 * 1024, {}},         // 32 KB
+-        {256 * 1024, {}},        // 256 KB
+-        {1 * 1024 * 1024, {}},   // 1 MB
+-        {2 * 1024 * 1024, {}},   // 2 MB
+-        {4 * 1024 * 1024, {}},   // 4 MB
+-        {8 * 1024 * 1024, {}},   // 8 MB
+-        {16 * 1024 * 1024, {}},  // 16 MB
+-        {32 * 1024 * 1024, {}},  // 32 MB
+-        {64 * 1024 * 1024, {}},  // 64 MB
+-        {128 * 1024 * 1024, {}}, // 128 MB
+-        {256 * 1024 * 1024, {}}, // 256 MB
++        {32 * 1024, {}},        // 32 KB
++        {256 * 1024, {}},       // 256 KB
++        {1 * 1024 * 1024, {}},  // 1 MB
++        {2 * 1024 * 1024, {}},  // 2 MB
++        {4 * 1024 * 1024, {}},  // 4 MB
++        {8 * 1024 * 1024, {}},  // 8 MB
++        {16 * 1024 * 1024, {}}, // 16 MB
++        {32 * 1024 * 1024, {}}, // 32 MB
+     };
+ }
+ 
+@@ -74,7 +84,7 @@ std::byte *PinnableBlockAllocator::allocate(size_t size) {
+             block->in_use = true;
+             block->use_count = 1;
+ 
+-            INFINICORE_CHECK_ERROR(infinirtMalloc(&block->ptr, block->size));
++            device_malloc_(&block->ptr, block->size);
+ 
+             all_blocks_[block->ptr] = block;
+             return reinterpret_cast<std::byte *>(block->ptr);
+@@ -82,9 +92,15 @@ std::byte *PinnableBlockAllocator::allocate(size_t size) {
+     }
+ 
+     // 2. Large block allocation
+-    // Try to reuse a frozen or free large block
+-    auto it = std::find_if(large_blocks_.begin(), large_blocks_.end(),
+-                           [size](const std::shared_ptr<Block> &b) { return b->size >= size && !b->in_use; });
++    size = align_up(size, LARGE_BLOCK_GRANULARITY);
++    // Reuse the best-fitting free large block, if it is close enough in size
++    auto it = large_blocks_.end();
++    for (auto candidate = large_blocks_.begin(); candidate != large_blocks_.end(); ++candidate) {
++        if (!(*candidate)->in_use && acceptable_reuse((*candidate)->size, size)
++            && (it == large_blocks_.end() || (*candidate)->size < (*it)->size)) {
++            it = candidate;
++        }
++    }
+ 
+     if (it != large_blocks_.end()) {
+         block = *it;
+@@ -97,11 +113,12 @@ std::byte *PinnableBlockAllocator::allocate(size_t size) {
+     // Allocate new large block
+     block = std::make_shared<Block>();
+     block->size = size;
++    block->large = true;
+     block->frozen = pinned_mode_;
+     block->in_use = true;
+     block->use_count = 1;
+ 
+-    INFINICORE_CHECK_ERROR(infinirtMalloc(&block->ptr, block->size));
++    device_malloc_(&block->ptr, block->size);
+ 
+     large_blocks_.push_back(block);
+     all_blocks_[block->ptr] = block;
+@@ -133,6 +150,11 @@ void PinnableBlockAllocator::deallocate(std::byte *ptr) {
+     }
+ 
+     block->in_use = false;
++    if (block->large) {
++        // Large blocks are found through large_blocks_; their sizes may equal
++        // a class size, so they must never enter a class free list.
++        return;
++    }
+     for (auto &cls : size_classes_) {
+         if (block->size == cls.block_size) {
+             cls.free_blocks.push_back(block);
+@@ -160,13 +182,27 @@ size_t PinnableBlockAllocator::mark_in_use_(void *ptr, bool in_use) {
+     return it->second->size;
+ }
+ 
++// Device allocation; when the device is out of memory, cached blocks that are
++// not in use are returned first and the allocation is retried once.
++void PinnableBlockAllocator::device_malloc_(void **ptr, size_t size) {
++    if (infinirtMalloc(ptr, size) == INFINI_STATUS_SUCCESS) {
++        return;
++    }
++    trim_locked_();
++    INFINICORE_CHECK_ERROR(infinirtMalloc(ptr, size));
++}
++
+ // ------------------- trim -------------------
+ void PinnableBlockAllocator::trim() {
+     std::lock_guard<std::mutex> lock(mutex_);
+-    // Free non-frozen size-class blocks
++    trim_locked_();
++}
++
++void PinnableBlockAllocator::trim_locked_() {
++    // Free non-frozen size-class blocks (entries re-marked in use stay)
+     for (auto &cls : size_classes_) {
+         for (auto it = cls.free_blocks.begin(); it != cls.free_blocks.end();) {
+-            if (!(*it)->frozen) {
++            if (!(*it)->frozen && !(*it)->in_use) {
+                 INFINICORE_CHECK_ERROR(infinirtFree((*it)->ptr));
+                 all_blocks_.erase((*it)->ptr);
+                 it = cls.free_blocks.erase(it);
+diff --git a/src/infinicore/context/allocators/pinnable_block_allocator.hpp b/src/infinicore/context/allocators/pinnable_block_allocator.hpp
+index f506fcff..bb830b7d 100644
+--- a/src/infinicore/context/allocators/pinnable_block_allocator.hpp
++++ b/src/infinicore/context/allocators/pinnable_block_allocator.hpp
+@@ -12,6 +12,7 @@ class PinnableBlockAllocator : public MemoryAllocator {
+     struct Block {
+         void *ptr = nullptr;  // Device pointer
+         size_t size = 0;      // Block size in bytes
++        bool large = false;   // Exact-size block tracked in large_blocks_
+         bool frozen = false;  // True if used in pinned/graph mode
+         bool in_use = false;  // Wether the block is currently in use
+         size_t use_count = 0; // Number of Memory owners for this block
+@@ -41,6 +42,10 @@ public:
+     void trim();
+ 
+ private:
++    // Callers hold mutex_.
++    void device_malloc_(void **ptr, size_t size);
++    void trim_locked_();
++
+     Device device_;
+ 
+     bool pinned_mode_ = false;
+diff --git a/src/infinicore/ops/distributed/all_to_all.cc b/src/infinicore/ops/distributed/all_to_all.cc
+new file mode 100644
+index 00000000..7da3a984
+--- /dev/null
++++ b/src/infinicore/ops/distributed/all_to_all.cc
+@@ -0,0 +1,85 @@
++#include "infinicore/ops/distributed/all_to_all.hpp"
++#include "../../utils.hpp"
++#include "infinicore/ops/distributed/collective_sync.hpp"
++
++#include "infinicore/context/context.hpp"
++
++namespace infinicore::op::distributed {
++namespace {
++
++void issue_all_to_all(Tensor output, const Tensor &input, int rank, int world_size,
++                      infinicclComm_t communicator, infinirtStream_t stream) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(output, input);
++    INFINICORE_ASSERT(output->is_contiguous() && input->is_contiguous());
++    INFINICORE_ASSERT(output->dtype() == input->dtype());
++    INFINICORE_ASSERT(output->numel() == input->numel());
++    INFINICORE_ASSERT(world_size > 0 && rank >= 0 && rank < world_size);
++    INFINICORE_ASSERT(input->numel() % static_cast<Size>(world_size) == 0);
++
++    const Size count = input->numel() / static_cast<Size>(world_size);
++    const Size bytes = count * dsize(input->dtype());
++    const auto dtype = static_cast<infiniDtype_t>(static_cast<int>(input->dtype()));
++    const auto *send = static_cast<const std::byte *>(static_cast<const void *>(input->data()));
++    auto *recv = static_cast<std::byte *>(static_cast<void *>(output->data()));
++
++    if (count > 0) {
++        INFINICORE_CHECK_ERROR(infinirtMemcpyAsync(recv + rank * bytes, send + rank * bytes, bytes,
++                                                   INFINIRT_MEMCPY_D2D, stream));
++    }
++    if (world_size > 1 && count > 0) {
++        INFINICORE_CHECK_ERROR(infinicclGroupStart(communicator));
++        for (int peer = 0; peer < world_size; ++peer) {
++            if (peer == rank) {
++                continue;
++            }
++            INFINICORE_CHECK_ERROR(infinicclSend(send + peer * bytes, count, dtype, peer,
++                                                 communicator, stream));
++            INFINICORE_CHECK_ERROR(infinicclRecv(recv + peer * bytes, count, dtype, peer,
++                                                 communicator, stream));
++        }
++        INFINICORE_CHECK_ERROR(infinicclGroupEnd(communicator));
++    }
++}
++
++} // namespace
++
++void all_to_all_(Tensor output, const Tensor &input, int rank, int world_size,
++                 infinicclComm_t communicator) {
++    release_launch_guard();
++    issue_all_to_all(output, input, rank, world_size, communicator,
++                     infinicore::context::getStream());
++    finish_collective();
++}
++
++void all_to_all_on_stream_(Tensor output, const Tensor &input, int rank, int world_size,
++                           infinicclComm_t communicator, infinirtStream_t stream) {
++    release_launch_guard();
++    issue_all_to_all(output, input, rank, world_size, communicator, stream);
++    if (synchronous_collectives()) {
++        INFINICORE_CHECK_ERROR(infinirtStreamSynchronize(stream));
++    }
++}
++
++void send_recv_on_stream_(const Tensor &send, int send_peer, Tensor recv, int recv_peer,
++                          infinicclComm_t communicator, infinirtStream_t stream) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(recv, send);
++    INFINICORE_ASSERT(recv->is_contiguous() && send->is_contiguous());
++    INFINICORE_ASSERT(recv->dtype() == send->dtype());
++    const auto dtype = static_cast<infiniDtype_t>(static_cast<int>(send->dtype()));
++    release_launch_guard();
++    INFINICORE_CHECK_ERROR(infinicclGroupStart(communicator));
++    if (send->numel() > 0) {
++        INFINICORE_CHECK_ERROR(infinicclSend(const_cast<std::byte *>(static_cast<const std::byte *>(send->data())),
++                                             send->numel(), dtype, send_peer, communicator, stream));
++    }
++    if (recv->numel() > 0) {
++        INFINICORE_CHECK_ERROR(infinicclRecv(recv->data(), recv->numel(), dtype, recv_peer,
++                                             communicator, stream));
++    }
++    INFINICORE_CHECK_ERROR(infinicclGroupEnd(communicator));
++    if (synchronous_collectives()) {
++        INFINICORE_CHECK_ERROR(infinirtStreamSynchronize(stream));
++    }
++}
++
++} // namespace infinicore::op::distributed
+diff --git a/src/infinicore/ops/distributed/allgather.cc b/src/infinicore/ops/distributed/allgather.cc
+index fcf9ab81..9a34414b 100644
+--- a/src/infinicore/ops/distributed/allgather.cc
++++ b/src/infinicore/ops/distributed/allgather.cc
+@@ -1,5 +1,6 @@
+ #include "infinicore/ops/distributed/allgather.hpp"
+ #include "../../utils.hpp"
++#include "infinicore/ops/distributed/collective_sync.hpp"
+ 
+ #include "infinicore/context/context.hpp"
+ 
+@@ -52,12 +53,14 @@ AllGather::~AllGather() {
+ 
+ void AllGather::run() const {
+     auto *meta = reinterpret_cast<AllGatherPlannedMeta *>(planned_meta_);
++    release_launch_guard();
+     INFINICORE_CHECK_ERROR(infinicclAllGather(meta->input->data(),
+                                               meta->output->data(),
+                                               meta->input->numel(),
+                                               static_cast<infiniDtype_t>(static_cast<int>(meta->input->dtype())),
+                                               meta->communicator,
+                                               infinicore::context::getStream()));
++    finish_collective();
+ }
+ 
+ void AllGather::execute(Tensor output, const Tensor &input, infinicclComm_t communicator) {
+@@ -93,6 +96,7 @@ AllGatherV::~AllGatherV() {
+ 
+ void AllGatherV::run() const {
+     auto *meta = reinterpret_cast<AllGatherVPlannedMeta *>(planned_meta_);
++    release_launch_guard();
+     INFINICORE_CHECK_ERROR(infinicclAllGatherV(meta->input->data(),
+                                                meta->output->data(),
+                                                meta->split_counts.data(),
+@@ -100,6 +104,7 @@ void AllGatherV::run() const {
+                                                static_cast<infiniDtype_t>(static_cast<int>(meta->input->dtype())),
+                                                meta->communicator,
+                                                infinicore::context::getStream()));
++    finish_collective();
+ }
+ 
+ void AllGatherV::execute(Tensor output,
+@@ -188,6 +193,7 @@ void allgatherv_many_(const std::vector<Tensor> &outputs,
+ 
+     const bool use_group = can_use_grouped_allgather(inputs, split_sizes) && !infinicore::context::isGraphRecording();
+     if (use_group) {
++        release_launch_guard();
+         INFINICORE_CHECK_ERROR(infinicclGroupStart(communicator));
+     }
+     for (size_t i = 0; i < inputs.size(); ++i) {
+diff --git a/src/infinicore/ops/distributed/allreduce.cc b/src/infinicore/ops/distributed/allreduce.cc
+index ddfc238c..3e37c398 100644
+--- a/src/infinicore/ops/distributed/allreduce.cc
++++ b/src/infinicore/ops/distributed/allreduce.cc
+@@ -1,5 +1,6 @@
+ #include "infinicore/ops/distributed/allreduce.hpp"
+ #include "../../utils.hpp"
++#include "infinicore/ops/distributed/collective_sync.hpp"
+ 
+ namespace infinicore::op::distributed {
+ 
+@@ -25,6 +26,7 @@ AllReduce::~AllReduce() {
+ void AllReduce::run() const {
+     PlannedMeta *meta = reinterpret_cast<PlannedMeta *>(planned_meta_);
+ 
++    release_launch_guard();
+     INFINICORE_CHECK_ERROR(infinicclAllReduce(meta->input->data(),
+                                               meta->output->data(),
+                                               meta->input->numel(),
+@@ -32,6 +34,7 @@ void AllReduce::run() const {
+                                               meta->op,
+                                               meta->communicator,
+                                               infinicore::context::getStream()));
++    finish_collective();
+ }
+ 
+ void AllReduce::execute(Tensor output, const Tensor &input, infinicclReduceOp_t op, infinicclComm_t communicator) {
+@@ -47,4 +50,19 @@ Tensor allreduce(const Tensor &input, infinicclReduceOp_t op, infinicclComm_t co
+ void allreduce_(Tensor output, const Tensor &input, infinicclReduceOp_t op, infinicclComm_t communicator) {
+     AllReduce::execute(output, input, op, communicator);
+ }
++
++void allreduce_on_stream_(Tensor output, const Tensor &input, infinicclReduceOp_t op,
++                          infinicclComm_t communicator, infinirtStream_t stream) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(output, input);
++    INFINICORE_ASSERT(output->is_contiguous() && input->is_contiguous());
++    INFINICORE_ASSERT(output->numel() == input->numel());
++    release_launch_guard();
++    INFINICORE_CHECK_ERROR(infinicclAllReduce(const_cast<void *>(static_cast<const void *>(input->data())),
++                                              output->data(), input->numel(),
++                                              static_cast<infiniDtype_t>(static_cast<int>(input->dtype())),
++                                              op, communicator, stream));
++    if (synchronous_collectives()) {
++        INFINICORE_CHECK_ERROR(infinirtStreamSynchronize(stream));
++    }
++}
+ } // namespace infinicore::op::distributed
+diff --git a/src/infinicore/ops/distributed/broadcast.cc b/src/infinicore/ops/distributed/broadcast.cc
+index f44c6332..30fad252 100644
+--- a/src/infinicore/ops/distributed/broadcast.cc
++++ b/src/infinicore/ops/distributed/broadcast.cc
+@@ -1,5 +1,6 @@
+ #include "infinicore/ops/distributed/broadcast.hpp"
+ #include "../../utils.hpp"
++#include "infinicore/ops/distributed/collective_sync.hpp"
+ 
+ #include "infinicore/context/context.hpp"
+ 
+@@ -28,6 +29,7 @@ Broadcast::~Broadcast() {
+ 
+ void Broadcast::run() const {
+     auto *meta = reinterpret_cast<BroadcastPlannedMeta *>(planned_meta_);
++    release_launch_guard();
+     INFINICORE_CHECK_ERROR(infinicclBroadcast(meta->input->data(),
+                                               meta->output->data(),
+                                               meta->input->numel(),
+@@ -35,6 +37,7 @@ void Broadcast::run() const {
+                                               meta->root,
+                                               meta->communicator,
+                                               infinicore::context::getStream()));
++    finish_collective();
+ }
+ 
+ void Broadcast::execute(Tensor output, const Tensor &input, int root, infinicclComm_t communicator) {
+diff --git a/src/infinicore/ops/distributed/collective_sync.cc b/src/infinicore/ops/distributed/collective_sync.cc
+new file mode 100644
+index 00000000..4c98d5e1
+--- /dev/null
++++ b/src/infinicore/ops/distributed/collective_sync.cc
+@@ -0,0 +1,55 @@
++#include "infinicore/ops/distributed/collective_sync.hpp"
++
++#include "infinicore/context/context.hpp"
++
++#include <mutex>
++
++namespace infinicore::op::distributed {
++
++namespace {
++thread_local bool synchronous = false;
++std::mutex launch_mutex;
++thread_local int guard_depth = 0;
++thread_local bool guard_owned = false;
++} // namespace
++
++FirstForwardLaunchGuard::FirstForwardLaunchGuard() {
++    if (!synchronous) {
++        return;
++    }
++    counted_ = true;
++    if (guard_depth++ == 0) {
++        launch_mutex.lock();
++        guard_owned = true;
++    }
++}
++
++FirstForwardLaunchGuard::~FirstForwardLaunchGuard() {
++    if (counted_ && --guard_depth == 0) {
++        release_launch_guard();
++    }
++}
++
++void release_launch_guard() {
++    if (guard_owned) {
++        guard_owned = false;
++        launch_mutex.unlock();
++    }
++}
++
++void set_synchronous_collectives(bool enabled) {
++    synchronous = enabled;
++}
++
++bool synchronous_collectives() {
++    return synchronous;
++}
++
++void finish_collective() {
++    if (synchronous) {
++        release_launch_guard();
++        infinicore::context::syncStream();
++    }
++}
++
++} // namespace infinicore::op::distributed
+diff --git a/src/infinicore/ops/distributed/reduce_scatter.cc b/src/infinicore/ops/distributed/reduce_scatter.cc
+index 60ec2462..c56d6881 100644
+--- a/src/infinicore/ops/distributed/reduce_scatter.cc
++++ b/src/infinicore/ops/distributed/reduce_scatter.cc
+@@ -1,5 +1,6 @@
+ #include "infinicore/ops/distributed/reduce_scatter.hpp"
+ #include "../../utils.hpp"
++#include "infinicore/ops/distributed/collective_sync.hpp"
+ 
+ #include "infinicore/context/context.hpp"
+ 
+@@ -54,6 +55,7 @@ ReduceScatter::~ReduceScatter() {
+ 
+ void ReduceScatter::run() const {
+     auto *meta = reinterpret_cast<ReduceScatterPlannedMeta *>(planned_meta_);
++    release_launch_guard();
+     INFINICORE_CHECK_ERROR(infinicclReduceScatter(meta->input->data(),
+                                                   meta->output->data(),
+                                                   meta->output->numel(),
+@@ -61,6 +63,7 @@ void ReduceScatter::run() const {
+                                                   meta->op,
+                                                   meta->communicator,
+                                                   infinicore::context::getStream()));
++    finish_collective();
+ }
+ 
+ void ReduceScatter::execute(Tensor output, const Tensor &input, infinicclReduceOp_t op, infinicclComm_t communicator) {
+@@ -98,6 +101,7 @@ ReduceScatterV::~ReduceScatterV() {
+ 
+ void ReduceScatterV::run() const {
+     auto *meta = reinterpret_cast<ReduceScatterVPlannedMeta *>(planned_meta_);
++    release_launch_guard();
+     INFINICORE_CHECK_ERROR(infinicclReduceScatterV(meta->input->data(),
+                                                    meta->output->data(),
+                                                    meta->split_counts.data(),
+@@ -106,6 +110,7 @@ void ReduceScatterV::run() const {
+                                                    meta->op,
+                                                    meta->communicator,
+                                                    infinicore::context::getStream()));
++    finish_collective();
+ }
+ 
+ void ReduceScatterV::execute(Tensor output,
+@@ -201,6 +206,7 @@ void reduce_scatterv_many_(const std::vector<Tensor> &outputs,
+ 
+     const bool use_group = can_use_grouped_reduce_scatter(outputs, split_sizes) && !infinicore::context::isGraphRecording();
+     if (use_group) {
++        release_launch_guard();
+         INFINICORE_CHECK_ERROR(infinicclGroupStart(communicator));
+     }
+     for (size_t i = 0; i < inputs.size(); ++i) {
+diff --git a/src/infinicore/ops/distributed/send_recv.cc b/src/infinicore/ops/distributed/send_recv.cc
+index 44543c46..56c19dad 100644
+--- a/src/infinicore/ops/distributed/send_recv.cc
++++ b/src/infinicore/ops/distributed/send_recv.cc
+@@ -1,4 +1,5 @@
+ #include "infinicore/ops/distributed/send_recv.hpp"
++#include "infinicore/ops/distributed/collective_sync.hpp"
+ #include "../../utils.hpp"
+ 
+ #include "infinicore/context/context.hpp"
+@@ -39,6 +40,7 @@ Send::~Send() {
+ 
+ void Send::run() const {
+     auto *meta = reinterpret_cast<SendPlannedMeta *>(planned_meta_);
++    release_launch_guard();
+     INFINICORE_CHECK_ERROR(infinicclSend(meta->input->data(),
+                                          meta->input->numel(),
+                                          static_cast<infiniDtype_t>(static_cast<int>(meta->input->dtype())),
+@@ -65,6 +67,7 @@ Recv::~Recv() {
+ 
+ void Recv::run() const {
+     auto *meta = reinterpret_cast<RecvPlannedMeta *>(planned_meta_);
++    release_launch_guard();
+     INFINICORE_CHECK_ERROR(infinicclRecv(meta->output->data(),
+                                          meta->output->numel(),
+                                          static_cast<infiniDtype_t>(static_cast<int>(meta->output->dtype())),
+diff --git a/src/infinicore/ops/h3_numerics/h3_numerics.cc b/src/infinicore/ops/h3_numerics/h3_numerics.cc
+new file mode 100644
+index 00000000..19681ca0
+--- /dev/null
++++ b/src/infinicore/ops/h3_numerics/h3_numerics.cc
+@@ -0,0 +1,173 @@
++#include "infinicore/ops/h3_numerics.hpp"
++#include "../../utils.hpp"
++#include <stdexcept>
++
++namespace infinicore::op {
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(H3RMSNorm);
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(H3SwiGLU);
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(H3RMSModulate);
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(H3RoPE);
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(H3GatedResidual);
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(H3GatedResidualRMSModulate);
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(H3QKNormRope);
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(H3RoPECache);
++
++H3RMSNorm::H3RMSNorm(Tensor y, const Tensor &x, const Tensor &w, float eps) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(y, x, w);
++    INFINICORE_GRAPH_OP_DISPATCH(y->device().getType(), y, x, w, eps);
++}
++void H3RMSNorm::execute(Tensor y, const Tensor &x, const Tensor &w, float eps) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(H3RMSNorm, y, x, w, eps);
++}
++Tensor h3_rms_norm(const Tensor &x, const Tensor &w, float eps) {
++    if (x->ndim() != 3 || w->ndim() != 1 || x->size(2) != w->size(0)
++        || x->dtype() != DataType::BF16 || w->dtype() != DataType::BF16
++        || (x->size(2) != 128 && x->size(2) != 5376)) {
++        throw std::invalid_argument("H3 RMSNorm requires BF16 [B,S,128|5376] and weight [D]");
++    }
++    auto y = Tensor::empty(x->shape(), x->dtype(), x->device());
++    H3RMSNorm::execute(y, x, w, eps);
++    return y;
++}
++
++H3SwiGLU::H3SwiGLU(Tensor y, const Tensor &up, const Tensor &gate) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(y, up, gate);
++    INFINICORE_GRAPH_OP_DISPATCH(y->device().getType(), y, up, gate);
++}
++void H3SwiGLU::execute(Tensor y, const Tensor &up, const Tensor &gate) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(H3SwiGLU, y, up, gate);
++}
++Tensor h3_swiglu(const Tensor &up, const Tensor &gate) {
++    if (up->ndim() != 3 || up->shape() != gate->shape()
++        || up->dtype() != DataType::BF16 || gate->dtype() != DataType::BF16) {
++        throw std::invalid_argument("H3 SwiGLU requires matching BF16 [B,S,D] inputs");
++    }
++    auto y = Tensor::empty(up->shape(), up->dtype(), up->device());
++    H3SwiGLU::execute(y, up, gate);
++    return y;
++}
++
++H3RMSModulate::H3RMSModulate(Tensor y, const Tensor &x, const Tensor &w,
++                           const Tensor &scale, const Tensor &shift, float eps) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(y, x, w, scale, shift);
++    INFINICORE_GRAPH_OP_DISPATCH(y->device().getType(), y, x, w, scale, shift, eps);
++}
++void H3RMSModulate::execute(Tensor y, const Tensor &x, const Tensor &w,
++                          const Tensor &scale, const Tensor &shift, float eps) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(H3RMSModulate, y, x, w, scale, shift, eps);
++}
++Tensor h3_rms_modulate(const Tensor &x, const Tensor &w, const Tensor &scale,
++                      const Tensor &shift, float eps) {
++    if (x->ndim() != 3 || x->size(2) != 5376 || w->ndim() != 1 || w->size(0) != 5376
++        || x->shape() != scale->shape() || x->shape() != shift->shape()
++        || x->dtype() != DataType::BF16 || w->dtype() != DataType::BF16
++        || scale->dtype() != DataType::BF16 || shift->dtype() != DataType::BF16) {
++        throw std::invalid_argument("H3 RMSNorm/AdaLN requires BF16 [B,S,5376] and weight [5376]");
++    }
++    auto y = Tensor::empty(x->shape(), x->dtype(), x->device());
++    H3RMSModulate::execute(y, x, w, scale, shift, eps);
++    return y;
++}
++H3RoPE::H3RoPE(Tensor y, const Tensor &x, const Tensor &cos, const Tensor &sin) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(y, x, cos, sin);
++    INFINICORE_GRAPH_OP_DISPATCH(y->device().getType(), y, x, cos, sin);
++}
++void H3RoPE::execute(Tensor y, const Tensor &x, const Tensor &cos, const Tensor &sin) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(H3RoPE, y, x, cos, sin);
++}
++Tensor h3_rope(const Tensor &x, const Tensor &cos, const Tensor &sin) {
++    if (x->ndim() != 3 || x->size(2) != 128 || cos->ndim() != 2
++        || cos->size(0) != x->size(0) || cos->size(1) != 48 || cos->shape() != sin->shape()
++        || x->dtype() != DataType::BF16 || cos->dtype() != DataType::BF16 || sin->dtype() != DataType::BF16) {
++        throw std::invalid_argument("H3 RoPE requires BF16 [S,H,128] and token-ordered angles [S,48]");
++    }
++    auto y = Tensor::empty(x->shape(), x->dtype(), x->device());
++    H3RoPE::execute(y, x, cos, sin);
++    return y;
++}
++
++namespace {
++void check_gated_residual(const Tensor &x, const Tensor &gate, const Tensor &y) {
++    if (x->ndim() != 3 || x->size(2) != 5376 || x->shape() != gate->shape() || x->shape() != y->shape()
++        || x->dtype() != DataType::BF16 || gate->dtype() != DataType::BF16 || y->dtype() != DataType::BF16) {
++        throw std::invalid_argument("H3 gated residual requires matching BF16 [B,S,5376] inputs");
++    }
++}
++} // namespace
++
++H3GatedResidual::H3GatedResidual(Tensor out, const Tensor &x, const Tensor &gate, const Tensor &y) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(out, x, gate, y);
++    INFINICORE_GRAPH_OP_DISPATCH(out->device().getType(), out, x, gate, y);
++}
++void H3GatedResidual::execute(Tensor out, const Tensor &x, const Tensor &gate, const Tensor &y) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(H3GatedResidual, out, x, gate, y);
++}
++Tensor h3_gated_residual(const Tensor &x, const Tensor &gate, const Tensor &y) {
++    check_gated_residual(x, gate, y);
++    auto out = Tensor::empty(x->shape(), x->dtype(), x->device());
++    H3GatedResidual::execute(out, x, gate, y);
++    return out;
++}
++
++H3GatedResidualRMSModulate::H3GatedResidualRMSModulate(Tensor residual, Tensor out, const Tensor &x,
++                                                       const Tensor &gate, const Tensor &y, const Tensor &w,
++                                                       const Tensor &scale, const Tensor &shift, float eps) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(residual, out, x, gate, y, w, scale, shift);
++    INFINICORE_GRAPH_OP_DISPATCH(out->device().getType(), residual, out, x, gate, y, w, scale, shift, eps);
++}
++void H3GatedResidualRMSModulate::execute(Tensor residual, Tensor out, const Tensor &x, const Tensor &gate,
++                                         const Tensor &y, const Tensor &w, const Tensor &scale,
++                                         const Tensor &shift, float eps) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(H3GatedResidualRMSModulate, residual, out, x, gate, y, w, scale, shift, eps);
++}
++std::pair<Tensor, Tensor> h3_gated_residual_rms_modulate(const Tensor &x, const Tensor &gate, const Tensor &y,
++                                                         const Tensor &w, const Tensor &scale,
++                                                         const Tensor &shift, float eps) {
++    check_gated_residual(x, gate, y);
++    if (w->ndim() != 1 || w->size(0) != 5376 || x->shape() != scale->shape() || x->shape() != shift->shape()
++        || w->dtype() != DataType::BF16 || scale->dtype() != DataType::BF16 || shift->dtype() != DataType::BF16) {
++        throw std::invalid_argument("H3 gated residual RMSNorm/AdaLN requires BF16 weight [5376] and [B,S,5376] modulation");
++    }
++    auto residual = Tensor::empty(x->shape(), x->dtype(), x->device());
++    auto out = Tensor::empty(x->shape(), x->dtype(), x->device());
++    H3GatedResidualRMSModulate::execute(residual, out, x, gate, y, w, scale, shift, eps);
++    return {residual, out};
++}
++
++H3QKNormRope::H3QKNormRope(Tensor out, const Tensor &x, const Tensor &w, const Tensor &cos,
++                           const Tensor &sin, float eps) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(out, x, w, cos, sin);
++    INFINICORE_GRAPH_OP_DISPATCH(out->device().getType(), out, x, w, cos, sin, eps);
++}
++void H3QKNormRope::execute(Tensor out, const Tensor &x, const Tensor &w, const Tensor &cos,
++                           const Tensor &sin, float eps) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(H3QKNormRope, out, x, w, cos, sin, eps);
++}
++void h3_qk_norm_rope_(Tensor out, const Tensor &x, const Tensor &w, const Tensor &cos,
++                      const Tensor &sin, float eps) {
++    if (x->ndim() != 4 || x->size(3) != 128 || out->shape() != x->shape() || w->ndim() != 1
++        || w->size(0) != 128 || cos->ndim() != 2 || cos->size(0) != x->size(0) || cos->size(1) != 48
++        || cos->shape() != sin->shape() || x->dtype() != DataType::BF16 || out->dtype() != DataType::BF16
++        || w->dtype() != DataType::BF16 || cos->dtype() != DataType::BF16 || sin->dtype() != DataType::BF16) {
++        throw std::invalid_argument("H3 q/k norm + RoPE requires BF16 [T,P,Hs,128], weight [128], angles [T,48]");
++    }
++    H3QKNormRope::execute(out, x, w, cos, sin, eps);
++}
++
++H3RoPECache::H3RoPECache(Tensor out, const Tensor &position, const Tensor &power) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(out, position, power);
++    INFINICORE_GRAPH_OP_DISPATCH(out->device().getType(), out, position, power);
++}
++void H3RoPECache::execute(Tensor out, const Tensor &position, const Tensor &power) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(H3RoPECache, out, position, power);
++}
++Tensor h3_rope_cache(const Tensor &position, const Tensor &power) {
++    if (position->ndim() != 2 || position->size(1) != 3 || position->dtype() != DataType::F64
++        || power->ndim() != 1 || power->size(0) != 16 || power->dtype() != DataType::F32) {
++        throw std::invalid_argument("H3 RoPE cache requires FP64 positions [T,3] and FP32 powers [16]");
++    }
++    auto out = Tensor::empty({position->size(0), 96}, DataType::BF16, position->device());
++    H3RoPECache::execute(out, position, power);
++    return out;
++}
++} // namespace infinicore::op
+diff --git a/src/infinicore/ops/h3_numerics/h3_numerics_ninetoothed.cc b/src/infinicore/ops/h3_numerics/h3_numerics_ninetoothed.cc
+new file mode 100644
+index 00000000..876a34b3
+--- /dev/null
++++ b/src/infinicore/ops/h3_numerics/h3_numerics_ninetoothed.cc
+@@ -0,0 +1,182 @@
++#if defined(ENABLE_HYGON_API) && defined(ENABLE_H3_NINETOOTHED)
++#include "infinicore/ops/h3_numerics.hpp"
++#include "h3_rms_exact_128.h"
++#include "h3_rms_exact_5376.h"
++#include "h3_swiglu_exact.h"
++#include "h3_rms_modulate_exact.h"
++#include "h3_rope_exact.h"
++#include "h3_gated_residual_exact.h"
++#include "h3_gated_residual_rms_modulate_exact.h"
++#include "h3_qk_norm_rope.h"
++#include "h3_rope_cache.h"
++#include <array>
++#include <stdexcept>
++#include <string>
++
++namespace infinicore::op::h3_numerics_impl {
++template<size_t N> struct View {
++    std::array<uint64_t, N> shape;
++    std::array<int64_t, N> strides;
++    NineToothedTensor tensor;
++    explicit View(const graph::GraphTensor &x) {
++        for (size_t i = 0; i < N; ++i) {
++            shape[i] = x->size(i);
++            strides[i] = x->stride(i);
++        }
++        tensor = {const_cast<void *>(static_cast<const void *>(x->data())), shape.data(), strides.data()};
++    }
++};
++// NineToothed's Python scalar ABI uses double; C++ callers use the same ABI.
++struct RMSMeta { graph::GraphTensor y, x, weight; double eps; };
++void *rms_plan(Tensor y, const Tensor &x, const Tensor &w, float eps) {
++    return new RMSMeta{graph::GraphTensor(y), graph::GraphTensor(x), graph::GraphTensor(w), eps};
++}
++void rms_run(void *meta) {
++    auto *p = static_cast<RMSMeta *>(meta);
++    View<3> x(p->x), y(p->y);
++    View<1> w(p->weight);
++    NineToothedTensor eps{&p->eps, nullptr, nullptr};
++    int status = p->x->size(2) == 128
++        ? launch_h3_rms_exact_128(context::getStream(), x.tensor, w.tensor, eps, y.tensor)
++        : launch_h3_rms_exact_5376(context::getStream(), x.tensor, w.tensor, eps, y.tensor);
++    if (status) throw std::runtime_error("H3 NineToothed RMSNorm launch failed: " + std::to_string(status));
++}
++void rms_cleanup(void **meta) { delete static_cast<RMSMeta *>(*meta); *meta = nullptr; }
++
++struct SwiGLUMeta { graph::GraphTensor y, up, gate; };
++void *swiglu_plan(Tensor y, const Tensor &up, const Tensor &gate) {
++    return new SwiGLUMeta{graph::GraphTensor(y), graph::GraphTensor(up), graph::GraphTensor(gate)};
++}
++void swiglu_run(void *meta) {
++    auto *p = static_cast<SwiGLUMeta *>(meta);
++    View<3> y(p->y), up(p->up), gate(p->gate);
++    const int status = launch_h3_swiglu_exact(context::getStream(), up.tensor, gate.tensor, y.tensor);
++    if (status) throw std::runtime_error("H3 NineToothed SwiGLU launch failed: " + std::to_string(status));
++}
++void swiglu_cleanup(void **meta) { delete static_cast<SwiGLUMeta *>(*meta); *meta = nullptr; }
++
++struct ModulateMeta { graph::GraphTensor y, x, weight, scale, shift; double eps; };
++void *modulate_plan(Tensor y, const Tensor &x, const Tensor &w,
++                    const Tensor &scale, const Tensor &shift, float eps) {
++    return new ModulateMeta{graph::GraphTensor(y), graph::GraphTensor(x), graph::GraphTensor(w),
++                            graph::GraphTensor(scale), graph::GraphTensor(shift), eps};
++}
++void modulate_run(void *meta) {
++    auto *p = static_cast<ModulateMeta *>(meta);
++    View<3> y(p->y), x(p->x), scale(p->scale), shift(p->shift);
++    View<1> w(p->weight);
++    NineToothedTensor eps{&p->eps, nullptr, nullptr};
++    const int status = launch_h3_rms_modulate_exact(context::getStream(), x.tensor, w.tensor,
++                                                   eps, scale.tensor, shift.tensor, y.tensor);
++    if (status) throw std::runtime_error("H3 NineToothed RMSNorm/AdaLN launch failed: " + std::to_string(status));
++}
++void modulate_cleanup(void **meta) { delete static_cast<ModulateMeta *>(*meta); *meta = nullptr; }
++
++struct RoPEMeta { graph::GraphTensor y, x, cos, sin; };
++void *rope_plan(Tensor y, const Tensor &x, const Tensor &cos, const Tensor &sin) {
++    return new RoPEMeta{graph::GraphTensor(y), graph::GraphTensor(x), graph::GraphTensor(cos), graph::GraphTensor(sin)};
++}
++void rope_run(void *meta) {
++    auto *p = static_cast<RoPEMeta *>(meta);
++    View<3> y(p->y), x(p->x);
++    View<2> cos(p->cos), sin(p->sin);
++    const int status = launch_h3_rope_exact(context::getStream(), x.tensor, x.tensor, x.tensor, cos.tensor, sin.tensor, y.tensor, y.tensor, y.tensor);
++    if (status) throw std::runtime_error("H3 NineToothed RoPE launch failed: " + std::to_string(status));
++}
++void rope_cleanup(void **meta) { delete static_cast<RoPEMeta *>(*meta); *meta = nullptr; }
++
++struct GatedResidualMeta { graph::GraphTensor out, x, gate, y; };
++void *gated_residual_plan(Tensor out, const Tensor &x, const Tensor &gate, const Tensor &y) {
++    return new GatedResidualMeta{graph::GraphTensor(out), graph::GraphTensor(x), graph::GraphTensor(gate),
++                                 graph::GraphTensor(y)};
++}
++void gated_residual_run(void *meta) {
++    auto *p = static_cast<GatedResidualMeta *>(meta);
++    View<3> out(p->out), x(p->x), gate(p->gate), y(p->y);
++    const int status = launch_h3_gated_residual_exact(context::getStream(), x.tensor, gate.tensor, y.tensor, out.tensor);
++    if (status) throw std::runtime_error("H3 NineToothed gated residual launch failed: " + std::to_string(status));
++}
++void gated_residual_cleanup(void **meta) { delete static_cast<GatedResidualMeta *>(*meta); *meta = nullptr; }
++
++struct GatedModulateMeta { graph::GraphTensor residual, out, x, gate, y, weight, scale, shift; double eps; };
++void *gated_modulate_plan(Tensor residual, Tensor out, const Tensor &x, const Tensor &gate, const Tensor &y,
++                          const Tensor &w, const Tensor &scale, const Tensor &shift, float eps) {
++    return new GatedModulateMeta{graph::GraphTensor(residual), graph::GraphTensor(out), graph::GraphTensor(x),
++                                 graph::GraphTensor(gate), graph::GraphTensor(y), graph::GraphTensor(w),
++                                 graph::GraphTensor(scale), graph::GraphTensor(shift), eps};
++}
++void gated_modulate_run(void *meta) {
++    auto *p = static_cast<GatedModulateMeta *>(meta);
++    View<3> residual(p->residual), out(p->out), x(p->x), gate(p->gate), y(p->y), scale(p->scale), shift(p->shift);
++    View<1> w(p->weight);
++    NineToothedTensor eps{&p->eps, nullptr, nullptr};
++    const int status = launch_h3_gated_residual_rms_modulate_exact(
++        context::getStream(), x.tensor, gate.tensor, y.tensor, w.tensor, eps, scale.tensor, shift.tensor,
++        residual.tensor, out.tensor);
++    if (status) throw std::runtime_error("H3 NineToothed gated residual RMSNorm/AdaLN launch failed: " + std::to_string(status));
++}
++void gated_modulate_cleanup(void **meta) { delete static_cast<GatedModulateMeta *>(*meta); *meta = nullptr; }
++
++struct QKNormRopeMeta { graph::GraphTensor out, x, weight, cos, sin; double eps; };
++void *qk_norm_rope_plan(Tensor out, const Tensor &x, const Tensor &w, const Tensor &cos,
++                        const Tensor &sin, float eps) {
++    return new QKNormRopeMeta{graph::GraphTensor(out), graph::GraphTensor(x), graph::GraphTensor(w),
++                              graph::GraphTensor(cos), graph::GraphTensor(sin), eps};
++}
++void qk_norm_rope_run(void *meta) {
++    auto *p = static_cast<QKNormRopeMeta *>(meta);
++    View<4> out(p->out), x(p->x);
++    View<1> w(p->weight);
++    View<2> cos(p->cos), sin(p->sin);
++    NineToothedTensor eps{&p->eps, nullptr, nullptr};
++    const int status = launch_h3_qk_norm_rope(context::getStream(), x.tensor, x.tensor, x.tensor,
++                                              w.tensor, w.tensor, w.tensor, eps, cos.tensor, sin.tensor,
++                                              out.tensor, out.tensor, out.tensor);
++    if (status) throw std::runtime_error("H3 NineToothed q/k norm + RoPE launch failed: " + std::to_string(status));
++}
++void qk_norm_rope_cleanup(void **meta) { delete static_cast<QKNormRopeMeta *>(*meta); *meta = nullptr; }
++
++struct RoPECacheMeta { graph::GraphTensor cos, sin, position, power; };
++void *rope_cache_plan(Tensor out, const Tensor &position, const Tensor &power) {
++    return new RoPECacheMeta{graph::GraphTensor(out->narrow({{1, 0, 48}})),
++                             graph::GraphTensor(out->narrow({{1, 48, 48}})),
++                             graph::GraphTensor(position), graph::GraphTensor(power)};
++}
++void rope_cache_run(void *meta) {
++    auto *p = static_cast<RoPECacheMeta *>(meta);
++    View<2> cos(p->cos), sin(p->sin), position(p->position);
++    View<1> power(p->power);
++    const int status = launch_h3_rope_cache(context::getStream(), position.tensor, power.tensor, cos.tensor, sin.tensor);
++    if (status) throw std::runtime_error("H3 NineToothed RoPE cache launch failed: " + std::to_string(status));
++}
++void rope_cache_cleanup(void **meta) { delete static_cast<RoPECacheMeta *>(*meta); *meta = nullptr; }
++
++static bool registered = []() {
++    H3RoPECache::plan_dispatcher().registerDevice(Device::Type::HYGON, &rope_cache_plan);
++    H3RoPECache::run_dispatcher().registerDevice(Device::Type::HYGON, &rope_cache_run);
++    H3RoPECache::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &rope_cache_cleanup);
++    H3QKNormRope::plan_dispatcher().registerDevice(Device::Type::HYGON, &qk_norm_rope_plan);
++    H3QKNormRope::run_dispatcher().registerDevice(Device::Type::HYGON, &qk_norm_rope_run);
++    H3QKNormRope::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &qk_norm_rope_cleanup);
++    H3GatedResidual::plan_dispatcher().registerDevice(Device::Type::HYGON, &gated_residual_plan);
++    H3GatedResidual::run_dispatcher().registerDevice(Device::Type::HYGON, &gated_residual_run);
++    H3GatedResidual::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &gated_residual_cleanup);
++    H3GatedResidualRMSModulate::plan_dispatcher().registerDevice(Device::Type::HYGON, &gated_modulate_plan);
++    H3GatedResidualRMSModulate::run_dispatcher().registerDevice(Device::Type::HYGON, &gated_modulate_run);
++    H3GatedResidualRMSModulate::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &gated_modulate_cleanup);
++    H3RMSNorm::plan_dispatcher().registerDevice(Device::Type::HYGON, &rms_plan);
++    H3RMSNorm::run_dispatcher().registerDevice(Device::Type::HYGON, &rms_run);
++    H3RMSNorm::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &rms_cleanup);
++    H3SwiGLU::plan_dispatcher().registerDevice(Device::Type::HYGON, &swiglu_plan);
++    H3SwiGLU::run_dispatcher().registerDevice(Device::Type::HYGON, &swiglu_run);
++    H3SwiGLU::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &swiglu_cleanup);
++    H3RMSModulate::plan_dispatcher().registerDevice(Device::Type::HYGON, &modulate_plan);
++    H3RMSModulate::run_dispatcher().registerDevice(Device::Type::HYGON, &modulate_run);
++    H3RMSModulate::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &modulate_cleanup);
++    H3RoPE::plan_dispatcher().registerDevice(Device::Type::HYGON, &rope_plan);
++    H3RoPE::run_dispatcher().registerDevice(Device::Type::HYGON, &rope_run);
++    H3RoPE::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &rope_cleanup);
++    return true;
++}();
++} // namespace infinicore::op::h3_numerics_impl
++#endif
+diff --git a/src/infinicore/ops/linear/linear.cc b/src/infinicore/ops/linear/linear.cc
+index 100b007b..87f011d7 100644
+--- a/src/infinicore/ops/linear/linear.cc
++++ b/src/infinicore/ops/linear/linear.cc
+@@ -2,8 +2,36 @@
+ #include "infinicore/ops/gemm.hpp"
+ #include "infinicore/ops/rearrange.hpp"
+ 
++#if defined(ENABLE_HYGON_API) && defined(ENABLE_ATEN)
++#include "infinicore/adaptor/aten_adaptor.hpp"
++#include <cstdlib>
++#include <cstring>
++#endif
++
+ namespace infinicore::op {
+ 
++#if defined(ENABLE_HYGON_API) && defined(ENABLE_ATEN)
++namespace {
++// k100-extreme, opt-in (INFINICORE_HYGON_LINEAR=lt): BF16 linear layers
++// through ATen with hipBLASLt, which picks faster kernels than the rocBLAS
++// path for H3's SP out/down projections on gfx928 (about 2% end to end).
++// Off by default: hipBLASLt loads kernel modules lazily per shape inside the
++// rank threads, and module loading concurrent with kernel launches in other
++// threads was seen to crash the DTK HIP runtime.
++bool aten_linear_enabled() {
++    static const bool enabled = [] {
++        const char *mode = std::getenv("INFINICORE_HYGON_LINEAR");
++        if (mode == nullptr || std::strcmp(mode, "lt") != 0) {
++            return false;
++        }
++        at::globalContext().setBlasPreferredBackend(at::BlasBackend::Cublaslt);
++        return true;
++    }();
++    return enabled;
++}
++} // namespace
++#endif
++
+ Tensor linear(Tensor input,
+               Tensor weight,
+               std::optional<Tensor> bias,
+@@ -44,6 +72,20 @@ void linear_(Tensor out,
+ 
+     // linear transformation
+     Tensor out_view = out->view({N, out_features});
++#if defined(ENABLE_HYGON_API) && defined(ENABLE_ATEN)
++    if (!bias.has_value() && alpha == 1.0f && out->dtype() == DataType::BF16
++        && out->device().getType() == Device::Type::HYGON && aten_linear_enabled()) {
++#if INFINICORE_TORCH_VERSION_GE_2_11
++        c10::cuda::CUDAStreamGuard guard(adaptor::get_hip_stream());
++#else
++        c10::hip::HIPStreamGuard guard(adaptor::get_hip_stream());
++#endif
++        auto result = adaptor::to_aten_tensor(out_view);
++        at::mm_out(result, adaptor::to_aten_tensor(input->view({N, in_features})),
++                   adaptor::to_aten_tensor(weight).t());
++        return;
++    }
++#endif
+     // Add bias
+     float beta = 0.0f;
+     if (bias.has_value()) {
+diff --git a/src/infinicore/ops/multi_head_attention/hygon/mha_flashattn_hygon.cc b/src/infinicore/ops/multi_head_attention/hygon/mha_flashattn_hygon.cc
+index 7a2aaf1d..94c0a2a4 100644
+--- a/src/infinicore/ops/multi_head_attention/hygon/mha_flashattn_hygon.cc
++++ b/src/infinicore/ops/multi_head_attention/hygon/mha_flashattn_hygon.cc
+@@ -70,6 +70,20 @@ void run(void *planned_meta) {
+ 
+     at::Tensor k_attn = k;
+     at::Tensor v_attn = v;
++    if (!is_causal || q.size(1) == k.size(1)) {
++        // Vendor flash attention through ATen SDPA (the kernel PyTorch picks;
++        // about 96 TFLOPS for H3 shapes on gfx928). Top-left causal alignment
++        // equals the bottom-right one below only for square scores.
++        auto result = at::scaled_dot_product_attention(
++            q.permute({0, 2, 1, 3}), k.permute({0, 2, 1, 3}), v.permute({0, 2, 1, 3}),
++            std::nullopt, 0.0, is_causal, static_cast<double>(scale),
++            /*enable_gqa=*/num_kv_heads != num_q_heads);
++        out_work.copy_(result.permute({0, 2, 1, 3}));
++        if (out_need_copy_back) {
++            p->out->copy_from(out_work_ic);
++        }
++        return;
++    }
+     if (num_kv_heads != num_q_heads) {
+         const int64_t repeat = num_q_heads / num_kv_heads;
+         k_attn = k.unsqueeze(3).repeat({1, 1, 1, repeat, 1}).reshape(q.sizes());
+@@ -95,12 +109,14 @@ void cleanup(void **planned_meta_ptr) {
+     *planned_meta_ptr = nullptr;
+ }
+ 
++#if !defined(ENABLE_H3_NINETOOTHED)
+ static bool registered = []() {
+     MultiheadAttention::plan_dispatcher().registerDevice(Device::Type::HYGON, &plan);
+     MultiheadAttention::run_dispatcher().registerDevice(Device::Type::HYGON, &run);
+     MultiheadAttention::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &cleanup);
+     return true;
+ }();
++#endif
+ 
+ } // namespace infinicore::op::mha_impl::flashattn
+ #endif // ENABLE_HYGON_API && ENABLE_FLASH_ATTN
+diff --git a/src/infinicore/ops/multi_head_attention/mha_ninetoothed.cc b/src/infinicore/ops/multi_head_attention/mha_ninetoothed.cc
+new file mode 100644
+index 00000000..c7819425
+--- /dev/null
++++ b/src/infinicore/ops/multi_head_attention/mha_ninetoothed.cc
+@@ -0,0 +1,106 @@
++#if defined(ENABLE_HYGON_API) && defined(ENABLE_H3_NINETOOTHED)
++#include "infinicore/ops/mha.hpp"
++#include "../infiniop_impl.hpp"
++#include "h3_full_attention.h"
++#include "h3_vision_attention_72.h"
++#include <array>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++
++#if defined(ENABLE_FLASH_ATTN)
++namespace infinicore::op::mha_impl::flashattn {
++void *plan(Tensor, const Tensor &, const Tensor &, const Tensor &,
++           std::optional<Tensor>, float, bool);
++void run(void *);
++void cleanup(void **);
++}
++#endif
++
++namespace infinicore::op::mha_impl::ninetoothed {
++struct PlannedMeta {
++    graph::GraphTensor out, q, k, v;
++    double scale;
++    void *baseline = nullptr;
++};
++
++static bool supported(const Tensor &out, const Tensor &q, const Tensor &k,
++                      const Tensor &v, const std::optional<Tensor> &alibi, bool causal) {
++    const char *vision = std::getenv("H3_QWEN_NINETOOTHED");
++    const bool vision_enabled = vision && std::strcmp(vision, "1") == 0;
++    // Query and key lengths may differ (sequence-parallel padding of queries):
++    // the kernel tiles Q and K/V independently and masks keys by K's length.
++    return !causal && !alibi && q->ndim() == 4 && k->ndim() == 4 && k->shape() == v->shape()
++        && q->shape() == out->shape() && q->size(0) == k->size(0)
++        && q->size(2) == k->size(2) && q->size(3) == k->size(3)
++        && q->size(1) > 0 && k->size(1) > 0
++        && (q->size(3) == 128 || (vision_enabled && q->size(3) == 72))
++        && q->dtype() == DataType::BF16 && k->dtype() == DataType::BF16
++        && v->dtype() == DataType::BF16 && out->dtype() == DataType::BF16;
++}
++
++void *plan(Tensor out, const Tensor &q, const Tensor &k, const Tensor &v,
++           std::optional<Tensor> alibi, float scale, bool causal) {
++    // k100-extreme: vendor flash attention (ATen SDPA) unless
++    // INFINICORE_HYGON_MHA=ninetoothed.
++    const char *mode = std::getenv("INFINICORE_HYGON_MHA");
++    const bool baseline = !mode || std::strcmp(mode, "aten") == 0;
++    if (mode && std::strcmp(mode, "ninetoothed") != 0 && !baseline) {
++        throw std::invalid_argument("INFINICORE_HYGON_MHA must be ninetoothed or aten");
++    }
++    void *fallback = nullptr;
++    if (baseline || !supported(out, q, k, v, alibi, causal)) {
++#if defined(ENABLE_FLASH_ATTN)
++        // Preserve the existing general MHA for non-H3 shapes, causal/GQA and dtypes.
++        fallback = flashattn::plan(out, q, k, v, alibi, scale, causal);
++#else
++        throw std::invalid_argument("H3 NineToothed MHA requires noncausal BF16 [B,S,H,128] self attention");
++#endif
++    }
++    return new PlannedMeta{graph::GraphTensor(out), graph::GraphTensor(q),
++                            graph::GraphTensor(k), graph::GraphTensor(v), scale, fallback};
++}
++
++struct View {
++    std::array<uint64_t, 4> shape;
++    std::array<int64_t, 4> strides;
++    NineToothedTensor tensor;
++    explicit View(const graph::GraphTensor &x)
++        : shape{x->size(0), x->size(2), x->size(1), x->size(3)},
++          strides{x->stride(0), x->stride(2), x->stride(1), x->stride(3)},
++          tensor{const_cast<void *>(static_cast<const void *>(x->data())), shape.data(), strides.data()} {}
++};
++
++void run(void *meta) {
++    auto *p = static_cast<PlannedMeta *>(meta);
++#if defined(ENABLE_FLASH_ATTN)
++    if (p->baseline) { flashattn::run(p->baseline); return; }
++#endif
++    View q(p->q), k(p->k), v(p->v), out(p->out);
++    NineToothedTensor scale{&p->scale, nullptr, nullptr};
++    const int status = p->q->size(3) == 72
++        ? launch_h3_vision_attention_72(context::getStream(), q.tensor, k.tensor, v.tensor, scale, out.tensor)
++        : launch_h3_full_attention(context::getStream(), q.tensor, k.tensor, v.tensor, scale, out.tensor);
++    if (status != 0) {
++        throw std::runtime_error("NineToothed HIP MHA launch failed: " + std::to_string(status));
++    }
++}
++
++void cleanup(void **meta) {
++    auto *p = static_cast<PlannedMeta *>(*meta);
++#if defined(ENABLE_FLASH_ATTN)
++    if (p->baseline) flashattn::cleanup(&p->baseline);
++#endif
++    delete p;
++    *meta = nullptr;
++}
++
++static bool registered = []() {
++    MultiheadAttention::plan_dispatcher().registerDevice(Device::Type::HYGON, &plan);
++    MultiheadAttention::run_dispatcher().registerDevice(Device::Type::HYGON, &run);
++    MultiheadAttention::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &cleanup);
++    return true;
++}();
++} // namespace infinicore::op::mha_impl::ninetoothed
++#endif
+diff --git a/src/infinicore/ops/timestep_embedding/timestep_embedding.cc b/src/infinicore/ops/timestep_embedding/timestep_embedding.cc
+new file mode 100644
+index 00000000..308e6a3a
+--- /dev/null
++++ b/src/infinicore/ops/timestep_embedding/timestep_embedding.cc
+@@ -0,0 +1,57 @@
++#include "infinicore/ops/timestep_embedding.hpp"
++
++#include "../../utils.hpp"
++
++#include <stdexcept>
++
++namespace infinicore::op {
++
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(TimestepEmbedding);
++
++TimestepEmbedding::TimestepEmbedding(Tensor output,
++                                     const Tensor &timestep,
++                                     float max_period) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(output, timestep);
++    INFINICORE_GRAPH_OP_DISPATCH(
++        output->device().getType(), output, timestep, max_period);
++}
++
++void TimestepEmbedding::execute(Tensor output,
++                                const Tensor &timestep,
++                                float max_period) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(
++        TimestepEmbedding, output, timestep, max_period);
++}
++
++Tensor timestep_embedding(const Tensor &timestep,
++                          size_t embedding_dim,
++                          float max_period) {
++    auto output = Tensor::empty(
++        {timestep->numel(), embedding_dim},
++        DataType::F32,
++        timestep->device());
++    timestep_embedding_(output, timestep, max_period);
++    return output;
++}
++
++void timestep_embedding_(Tensor output,
++                         const Tensor &timestep,
++                         float max_period) {
++    if (timestep->ndim() != 1) {
++        throw std::runtime_error("timestep_embedding expects timestep shape [N]");
++    }
++    if (output->ndim() != 2 || output->size(0) != timestep->size(0)
++        || output->size(1) == 0 || output->size(1) % 2 != 0) {
++        throw std::runtime_error(
++            "timestep_embedding expects output shape [N, even embedding_dim]");
++    }
++    if (output->dtype() != DataType::F32) {
++        throw std::runtime_error("timestep_embedding output must be float32");
++    }
++    if (max_period <= 0.0f) {
++        throw std::runtime_error("timestep_embedding max_period must be positive");
++    }
++    TimestepEmbedding::execute(output, timestep, max_period);
++}
++
++} // namespace infinicore::op
+diff --git a/src/infinicore/ops/timestep_embedding/timestep_embedding_infiniop.cc b/src/infinicore/ops/timestep_embedding/timestep_embedding_infiniop.cc
+new file mode 100644
+index 00000000..4c98e87b
+--- /dev/null
++++ b/src/infinicore/ops/timestep_embedding/timestep_embedding_infiniop.cc
+@@ -0,0 +1,46 @@
++#include "../infiniop_impl.hpp"
++#include "infinicore/ops/timestep_embedding.hpp"
++
++namespace infinicore::op::timestep_embedding_impl::infiniop {
++
++INFINIOP_CACHABLE_DESCRIPTOR(Descriptor, TimestepEmbedding, 100);
++
++struct PlannedMeta {
++    std::shared_ptr<Descriptor> descriptor;
++    graph::GraphTensor output, timestep;
++    float max_period;
++};
++
++void *plan(Tensor output, const Tensor &timestep, float max_period) {
++    size_t seed = hash_combine(output, timestep);
++
++    INFINIOP_CACHABLE_DESCRIPTOR_GET_OR_CREATE(
++        Descriptor, descriptor, TimestepEmbedding,
++        seed, output->desc(), timestep->desc());
++
++    return new PlannedMeta{
++        descriptor,
++        graph::GraphTensor(output),
++        graph::GraphTensor(timestep),
++        max_period};
++}
++
++void run(void *planned_meta) {
++    auto planned = reinterpret_cast<PlannedMeta *>(planned_meta);
++    INFINICORE_CHECK_ERROR(infiniopTimestepEmbedding(
++        planned->descriptor->desc,
++        planned->output->data(),
++        planned->timestep->data(),
++        planned->max_period,
++        context::getStream()));
++}
++
++void cleanup(void **planned_meta_ptr) {
++    delete *reinterpret_cast<PlannedMeta **>(planned_meta_ptr);
++    *planned_meta_ptr = nullptr;
++}
++
++INFINICORE_GRAPH_OP_REGISTER_ALLDEVICE(
++    TimestepEmbedding, &plan, &run, &cleanup);
++
++} // namespace infinicore::op::timestep_embedding_impl::infiniop
+diff --git a/src/infinicore/pybind11/context.hpp b/src/infinicore/pybind11/context.hpp
+index 9c24a322..2f800e50 100644
+--- a/src/infinicore/pybind11/context.hpp
++++ b/src/infinicore/pybind11/context.hpp
+@@ -24,6 +24,7 @@ inline void bind(py::module &m) {
+     // Synchronization
+     m.def("sync_stream", &syncStream, "Synchronize the current stream");
+     m.def("sync_device", &syncDevice, "Synchronize the current device");
++    m.def("trim_memory", &trimMemory, "Release unused allocator blocks on the current device");
+ 
+     // Graph
+     m.def("is_graph_recording", &isGraphRecording, "Check if graph recording is turned on");
+diff --git a/src/infinicore/pybind11/ops.hpp b/src/infinicore/pybind11/ops.hpp
+index e78adf27..65f70d8f 100644
+--- a/src/infinicore/pybind11/ops.hpp
++++ b/src/infinicore/pybind11/ops.hpp
+@@ -3,6 +3,7 @@
+ #include <pybind11/pybind11.h>
+ 
+ #include "ops/acos.hpp"
++#include "ops/h3_numerics.hpp"
+ #include "ops/adaptive_avg_pool1d.hpp"
+ #include "ops/adaptive_avg_pool3d.hpp"
+ #include "ops/adaptive_max_pool1d.hpp"
+@@ -135,6 +136,7 @@
+ #include "ops/tan.hpp"
+ #include "ops/tanh.hpp"
+ #include "ops/tanhshrink.hpp"
++#include "ops/timestep_embedding.hpp"
+ #include "ops/topk.hpp"
+ #include "ops/topksoftmax.hpp"
+ #include "ops/triplet_margin_loss.hpp"
+@@ -286,6 +288,7 @@ inline void bind(py::module &m) {
+     bind_sigmoid(m);
+     bind_silu(m);
+     bind_swiglu(m);
++    bind_h3_numerics(m);
+     bind_tan(m);
+     bind_tanh(m);
+     bind_tanhshrink(m);
+@@ -318,6 +321,7 @@ inline void bind(py::module &m) {
+     bind_linear_w8a8i8(m);
+     bind_silu_and_mul(m);
+     bind_situ_and_mul(m);
++    bind_timestep_embedding(m);
+     bind_sum(m);
+     bind_var_mean(m);
+     bind_var(m);
+diff --git a/src/infinicore/pybind11/ops/h3_numerics.hpp b/src/infinicore/pybind11/ops/h3_numerics.hpp
+new file mode 100644
+index 00000000..81b97bef
+--- /dev/null
++++ b/src/infinicore/pybind11/ops/h3_numerics.hpp
+@@ -0,0 +1,15 @@
++#pragma once
++#include <pybind11/pybind11.h>
++#include <pybind11/stl.h>
++#include "infinicore/ops/h3_numerics.hpp"
++namespace infinicore::ops {
++inline void bind_h3_numerics(pybind11::module &m) {
++    m.def("h3_rms_norm", &op::h3_rms_norm);
++    m.def("h3_swiglu", &op::h3_swiglu);
++    m.def("h3_rms_modulate", &op::h3_rms_modulate);
++    m.def("h3_rope", &op::h3_rope);
++    m.def("h3_rope_cache", &op::h3_rope_cache);
++    m.def("h3_gated_residual", &op::h3_gated_residual);
++    m.def("h3_gated_residual_rms_modulate", &op::h3_gated_residual_rms_modulate);
++}
++}
+diff --git a/src/infinicore/pybind11/ops/timestep_embedding.hpp b/src/infinicore/pybind11/ops/timestep_embedding.hpp
+new file mode 100644
+index 00000000..da533d04
+--- /dev/null
++++ b/src/infinicore/pybind11/ops/timestep_embedding.hpp
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <pybind11/pybind11.h>
++
++#include "infinicore/ops/timestep_embedding.hpp"
++
++namespace py = pybind11;
++
++namespace infinicore::ops {
++
++inline void bind_timestep_embedding(py::module &m) {
++    m.def("timestep_embedding",
++          &op::timestep_embedding,
++          py::arg("timestep"),
++          py::arg("embedding_dim") = 256,
++          py::arg("max_period") = 10000.0f,
++          R"doc(Build sinusoidal timestep embeddings on the active device.)doc");
++
++    m.def("timestep_embedding_",
++          &op::timestep_embedding_,
++          py::arg("output"),
++          py::arg("timestep"),
++          py::arg("max_period") = 10000.0f,
++          R"doc(Build sinusoidal timestep embeddings into output.)doc");
++}
++
++} // namespace infinicore::ops
+diff --git a/src/infinicore/tensor/copy.cc b/src/infinicore/tensor/copy.cc
+index 1297d9f8..f4014cb9 100644
+--- a/src/infinicore/tensor/copy.cc
++++ b/src/infinicore/tensor/copy.cc
+@@ -23,9 +23,11 @@ void TensorImpl::copy_from(Tensor src) {
+             "Cannot copy from tensor with different shape. Src: " + src->info() + " Dst: " + this->info());
+     }
+     if (this->device() == src->device()) {
++        context::setDevice(this->device());
+         op::rearrange_(Tensor(const_cast<TensorImpl *>(this)->shared_from_this()), src);
+     } else {
+         if (!src->is_contiguous()) {
++            context::setDevice(src->device());
+             src = src->contiguous();
+         }
+ 
+@@ -50,6 +52,19 @@ void TensorImpl::copy_from(Tensor src) {
+                 context::memcpyH2D(local_src->data(), src->data(), copy_size);
+                 op::rearrange_(Tensor(const_cast<TensorImpl *>(this)->shared_from_this()), local_src);
+             }
++        } else {
++            if (this->device().getType() != src->device().getType()) {
++                throw std::runtime_error(
++                    "Cannot copy directly between different accelerator types. Src: " + src->info() + " Dst: " + this->info());
++            }
++            context::setDevice(this->device());
++            if (this->is_contiguous()) {
++                context::memcpyD2D(this->data(), src->data(), copy_size);
++            } else {
++                auto local_src = Tensor::empty(this->shape(), this->dtype(), this->device());
++                context::memcpyD2D(local_src->data(), src->data(), copy_size);
++                op::rearrange_(Tensor(const_cast<TensorImpl *>(this)->shared_from_this()), local_src);
++            }
+         }
+     }
+ }
+diff --git a/src/infiniop/devices/nvidia/nvidia_common.cu b/src/infiniop/devices/nvidia/nvidia_common.cu
+index eca122dc..230c9b03 100644
+--- a/src/infiniop/devices/nvidia/nvidia_common.cu
++++ b/src/infiniop/devices/nvidia/nvidia_common.cu
+@@ -1,4 +1,6 @@
+ #include "nvidia_handle.cuh"
++#include <cstdlib>
++#include <cstring>
+ 
+ namespace device {
+ 
+@@ -34,6 +36,18 @@ infiniStatus_t Handle::Internal::useCublas(cudaStream_t stream, const Fn<cublasH
+     if (!handle) {
+         CHECK_CUBLAS(cublasCreate(&(*handle)));
+     }
++#if defined(ENABLE_HYGON_API)
++    // H3_DETERMINISTIC_BLAS=1: no atomics (e.g. split-K partial sums) in BLAS,
++    // so every GEMM is bitwise repeatable. Applied on every use, not only at
++    // handle creation: the first handle is created with the device context,
++    // possibly before the variable is set (e.g. by Python defaults), and is
++    // reused for the life of the process. PyTorch's own handles are untouched.
++    const char *deterministic = std::getenv("H3_DETERMINISTIC_BLAS");
++    CHECK_CUBLAS(cublasSetAtomicsMode(
++        *handle, deterministic && std::strcmp(deterministic, "1") == 0
++                     ? CUBLAS_ATOMICS_NOT_ALLOWED
++                     : CUBLAS_ATOMICS_ALLOWED));
++#endif
+     CHECK_CUBLAS(cublasSetStream(*handle, stream));
+     CHECK_STATUS(f(*handle));
+     blas_handles.push(std::move(*handle));
+diff --git a/src/infiniop/ops/gemm/nvidia/gemm_nvidia.cu b/src/infiniop/ops/gemm/nvidia/gemm_nvidia.cu
+index 26bff85f..fe708b9b 100644
+--- a/src/infiniop/ops/gemm/nvidia/gemm_nvidia.cu
++++ b/src/infiniop/ops/gemm/nvidia/gemm_nvidia.cu
+@@ -1,26 +1,60 @@
+ #include "../../../devices/nvidia/nvidia_handle.cuh"
+ #include "gemm_nvidia.cuh"
+-#if !defined(ENABLE_ILUVATAR_API) && !defined(ENABLE_HYGON_API)
++// cuBLASLt BF16 path: NVIDIA always; Hygon on request (DTK maps the cuBLASLt
++// API onto hipBLASLt), INFINICORE_HYGON_GEMM=lt.
++#if !defined(ENABLE_ILUVATAR_API)
++#define INFINIOP_GEMM_LT 1
+ #include <cublasLt.h>
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <vector>
+ #endif
+ 
+ namespace op::gemm::nvidia {
+ 
+ struct Descriptor::Opaque {
+     std::shared_ptr<device::nvidia::Handle::Internal> internal;
+-#if !defined(ENABLE_ILUVATAR_API) && !defined(ENABLE_HYGON_API)
++#if defined(INFINIOP_GEMM_LT)
+     cublasLtHandle_t lt_handle = nullptr;
+     cublasLtMatmulDesc_t lt_desc = nullptr;
+     cublasLtMatrixLayout_t a_layout = nullptr;
+     cublasLtMatrixLayout_t b_layout = nullptr;
+     cublasLtMatrixLayout_t c_layout = nullptr;
++    // Explicit heuristic choice: DTK's cuBLASLt (hipBLASLt) needs an algo.
++    cublasLtMatmulAlgo_t lt_algo{};
++    bool lt_has_algo = false;
++    size_t lt_workspace = 0;
++    // Offline tuning (INFINICORE_GEMM_LT_AUTOTUNE=1): every heuristic
++    // candidate, timed on the first call; see Opaque::autotune.
++    std::string lt_key;
++    std::vector<cublasLtMatmulHeuristicResult_t> lt_candidates;
++    bool lt_tuned = true;
++    void autotune(const MatmulInfo &info, const void *a, const void *b, const void *c,
++                  const float *alpha, const float *beta, void *workspace, size_t workspace_size,
++                  cudaStream_t stream);
+ 
+     void destroyLtDescriptors();
+     bool createBf16LtDescriptors(const MatmulInfo &info);
+ #endif
+ };
+ 
+-#if !defined(ENABLE_ILUVATAR_API) && !defined(ENABLE_HYGON_API)
++#if defined(INFINIOP_GEMM_LT)
++static bool ltEnabled() {
++#if defined(ENABLE_HYGON_API)
++    const char *mode = std::getenv("INFINICORE_HYGON_GEMM");
++    return mode != nullptr && std::strcmp(mode, "lt") == 0;
++#else
++    return true;
++#endif
++}
++
+ static size_t ltLayoutRows(const BlasMatrix &matrix) {
+     return matrix.row_stride == 1 ? matrix.rows : matrix.cols;
+ }
+@@ -65,6 +99,74 @@ void Descriptor::Opaque::destroyLtDescriptors() {
+     }
+ }
+ 
++// Per-shape choice among hipBLASLt's heuristic candidates.
++//
++// cublasLtMatmulAlgoGetHeuristic returns candidates in the library's
++// predicted order; the first is not always the fastest on a power-capped
++// card. INFINICORE_GEMM_LT_TABLE names a text file of offline-measured
++// choices, one per line: "<device> <ops> m n k batch lda ldb ldc = <index>"
++// ('#' starts a comment). Shapes not listed use candidate 0. The table is
++// produced by running the workload once with INFINICORE_GEMM_LT_AUTOTUNE=1,
++// which times every candidate on the first call of each shape and prints the
++// table line to stderr (tools/tune_gemm_lt.py collects them).
++static constexpr int kLtMaxCandidates = 16;
++
++static bool ltAutotuneEnabled() {
++    const char *v = std::getenv("INFINICORE_GEMM_LT_AUTOTUNE");
++    return v != nullptr && std::strcmp(v, "1") == 0;
++}
++
++static std::string ltDeviceName() {
++    int device = 0;
++    cudaDeviceProp prop{};
++    if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
++        return "unknown";
++    }
++    std::string name(prop.name);
++    for (auto &ch : name) {
++        if (ch == ' ') {
++            ch = '_';
++        }
++    }
++    return name.empty() ? "unknown" : name;
++}
++
++static std::string ltKey(const MatmulInfo &info) {
++    std::ostringstream key;
++    key << ltDeviceName() << ' '
++        << (info.a_matrix.row_stride == 1 ? 'N' : 'T') << (info.b_matrix.row_stride == 1 ? 'N' : 'T')
++        << ' ' << info.m << ' ' << info.n << ' ' << info.k << ' ' << info.batch << ' '
++        << info.a_matrix.ld() << ' ' << info.b_matrix.ld() << ' ' << info.c_matrix.ld();
++    return key.str();
++}
++
++static const std::map<std::string, int> &ltTable() {
++    static std::map<std::string, int> table;
++    static std::once_flag once;
++    std::call_once(once, [] {
++        const char *path = std::getenv("INFINICORE_GEMM_LT_TABLE");
++        if (path == nullptr || *path == '\0') {
++            return;
++        }
++        std::ifstream in(path);
++        std::string line;
++        while (std::getline(in, line)) {
++            line = line.substr(0, line.find('#'));
++            const auto eq = line.find('=');
++            if (eq == std::string::npos) {
++                continue;
++            }
++            std::istringstream fields(line.substr(0, eq));
++            std::string field, key;
++            while (fields >> field) {
++                key += (key.empty() ? "" : " ") + field;
++            }
++            table[key] = std::atoi(line.c_str() + eq + 1);
++        }
++    });
++    return table;
++}
++
+ bool Descriptor::Opaque::createBf16LtDescriptors(const MatmulInfo &info) {
+     auto op_a = info.a_matrix.row_stride == 1 ? CUBLAS_OP_N : CUBLAS_OP_T;
+     auto op_b = info.b_matrix.row_stride == 1 ? CUBLAS_OP_N : CUBLAS_OP_T;
+@@ -110,14 +212,131 @@ bool Descriptor::Opaque::createBf16LtDescriptors(const MatmulInfo &info) {
+         return false;
+     }
+ 
+-    return setLtLayoutBatch(a_layout, info.a_matrix, info.batch)
+-        && setLtLayoutBatch(b_layout, info.b_matrix, info.batch)
+-        && setLtLayoutBatch(c_layout, info.c_matrix, info.batch);
++    if (!(setLtLayoutBatch(a_layout, info.a_matrix, info.batch)
++          && setLtLayoutBatch(b_layout, info.b_matrix, info.batch)
++          && setLtLayoutBatch(c_layout, info.c_matrix, info.batch))) {
++        return false;
++    }
++
++    // Best heuristic algorithm within a workspace limit (MiB), chosen once
++    // per descriptor (descriptors are cached per shape).
++    size_t workspace_limit = size_t(32) << 20;
++    if (const char *mb = std::getenv("INFINICORE_GEMM_LT_WORKSPACE_MB")) {
++        workspace_limit = static_cast<size_t>(std::strtoull(mb, nullptr, 10)) << 20;
++    }
++    cublasLtMatmulPreference_t preference = nullptr;
++    if (cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS) {
++        return false;
++    }
++    bool ok = cublasLtMatmulPreferenceSetAttribute(
++                  preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
++                  &workspace_limit, sizeof(workspace_limit))
++           == CUBLAS_STATUS_SUCCESS;
++    cublasLtMatmulHeuristicResult_t results[kLtMaxCandidates]{};
++    int found = 0;
++    ok = ok
++      && cublasLtMatmulAlgoGetHeuristic(lt_handle, lt_desc, a_layout, b_layout, c_layout, c_layout,
++                                        preference, kLtMaxCandidates, results, &found)
++             == CUBLAS_STATUS_SUCCESS
++      && found > 0;
++    cublasLtMatmulPreferenceDestroy(preference);
++    if (!ok) {
++        return false;
++    }
++    lt_key = ltKey(info);
++    int choice = 0;
++    const auto &table = ltTable();
++    if (auto it = table.find(lt_key); it != table.end() && it->second >= 0 && it->second < found) {
++        choice = it->second;
++    }
++    lt_algo = results[choice].algo;
++    lt_workspace = results[choice].workspaceSize;
++    lt_has_algo = true;
++    if (ltAutotuneEnabled()) {
++        lt_candidates.assign(results, results + found);
++        for (const auto &candidate : lt_candidates) {
++            lt_workspace = std::max(lt_workspace, candidate.workspaceSize);
++        }
++        lt_tuned = false;
++    }
++    return true;
++}
++
++// Times every candidate on the caller's operands, writing into scratch
++// outputs (C is only read), and keeps the fastest one whose result is
++// bitwise reproducible between two runs (no atomics-based split-K). Prints
++// "<key> = <index>  # index:ms ..." to stderr. Diagnostic/offline only.
++void Descriptor::Opaque::autotune(const MatmulInfo &info, const void *a, const void *b, const void *c,
++                                  const float *alpha, const float *beta, void *workspace,
++                                  size_t workspace_size, cudaStream_t stream) {
++    Opaque *o = this;
++    o->lt_tuned = true;
++    const auto &cm = info.c_matrix;
++    const size_t cols = cm.row_stride == 1 ? cm.cols : cm.rows;
++    const size_t elems = static_cast<size_t>(cm.ld()) * cols
++                       + (info.batch > 1 ? static_cast<size_t>(cm.stride) * (info.batch - 1) : 0);
++    const size_t bytes = elems * 2;
++    void *d0 = nullptr, *d1 = nullptr;
++    if (cudaMalloc(&d0, bytes) != cudaSuccess || cudaMalloc(&d1, bytes) != cudaSuccess) {
++        cudaFree(d0);
++        std::fprintf(stderr, "[infinicore.gemm_lt] %s autotune skipped: no scratch memory\n", o->lt_key.c_str());
++        return;
++    }
++    cudaEvent_t start, stop;
++    cudaEventCreate(&start);
++    cudaEventCreate(&stop);
++    std::vector<char> h0(bytes), h1(bytes);
++    auto run = [&](const cublasLtMatmulHeuristicResult_t &cand, void *d) {
++        return cublasLtMatmul(o->lt_handle, o->lt_desc, alpha, a, o->a_layout, b, o->b_layout, beta,
++                              c, o->c_layout, d, o->c_layout, &cand.algo, workspace, workspace_size, stream);
++    };
++    int best = -1;
++    float best_ms = 0.0f;
++    std::ostringstream report;
++    constexpr int repeats = 5;
++    for (size_t i = 0; i < o->lt_candidates.size(); ++i) {
++        const auto &cand = o->lt_candidates[i];
++        report << ' ' << i << ':';
++        if (cand.workspaceSize > workspace_size || run(cand, d0) != CUBLAS_STATUS_SUCCESS) {
++            report << "fail";
++            continue;
++        }
++        cudaEventRecord(start, stream);
++        for (int r = 0; r < repeats; ++r) {
++            run(cand, d0);
++        }
++        cudaEventRecord(stop, stream);
++        cudaEventSynchronize(stop);
++        float ms = 0.0f;
++        cudaEventElapsedTime(&ms, start, stop);
++        ms /= repeats;
++        run(cand, d1);
++        cudaStreamSynchronize(stream);
++        cudaMemcpy(h0.data(), d0, bytes, cudaMemcpyDeviceToHost);
++        cudaMemcpy(h1.data(), d1, bytes, cudaMemcpyDeviceToHost);
++        const bool reproducible = std::memcmp(h0.data(), h1.data(), bytes) == 0;
++        char buf[32];
++        std::snprintf(buf, sizeof(buf), "%.3f%s", ms, reproducible ? "" : "(nondet)");
++        report << buf;
++        if (reproducible && (best < 0 || ms < best_ms)) {
++            best = static_cast<int>(i);
++            best_ms = ms;
++        }
++    }
++    cudaEventDestroy(start);
++    cudaEventDestroy(stop);
++    cudaFree(d0);
++    cudaFree(d1);
++    if (best >= 0) {
++        o->lt_algo = o->lt_candidates[best].algo;
++    }
++    std::fprintf(stderr, "[infinicore.gemm_lt] %s = %d  #%s\n", o->lt_key.c_str(), best < 0 ? 0 : best,
++                 report.str().c_str());
+ }
+ #endif
+ 
+ Descriptor::~Descriptor() {
+-#if !defined(ENABLE_ILUVATAR_API) && !defined(ENABLE_HYGON_API)
++#if defined(INFINIOP_GEMM_LT)
+     if (_opaque) {
+         _opaque->destroyLtDescriptors();
+     }
+@@ -141,14 +360,20 @@ infiniStatus_t Descriptor::create(
+ 
+     auto info = result.take();
+     auto opaque = new Opaque{handle->internal()};
+-#if !defined(ENABLE_ILUVATAR_API) && !defined(ENABLE_HYGON_API)
+-    if (dtype == INFINI_DTYPE_BF16 && !opaque->createBf16LtDescriptors(info)) {
+-        opaque->destroyLtDescriptors();
++    size_t workspace_size = 0;
++#if defined(INFINIOP_GEMM_LT)
++    if (dtype == INFINI_DTYPE_BF16 && ltEnabled()) {
++        if (opaque->createBf16LtDescriptors(info)) {
++            workspace_size = opaque->lt_workspace;
++        } else {
++            opaque->destroyLtDescriptors();
++            opaque->lt_has_algo = false;
++        }
+     }
+ #endif
+ 
+     *desc_ptr = new Descriptor(
+-        dtype, info, 0,
++        dtype, info, workspace_size,
+         opaque,
+         handle->device, handle->device_id);
+     return INFINI_STATUS_SUCCESS;
+@@ -208,9 +433,14 @@ infiniStatus_t Descriptor::calculate(
+     auto op_a = _info.a_matrix.row_stride == 1 ? CUBLAS_OP_N : CUBLAS_OP_T;
+     auto op_b = _info.b_matrix.row_stride == 1 ? CUBLAS_OP_N : CUBLAS_OP_T;
+ 
+-#if !defined(ENABLE_ILUVATAR_API) && !defined(ENABLE_HYGON_API)
++#if defined(INFINIOP_GEMM_LT)
+     if (_dtype == INFINI_DTYPE_BF16 && _opaque->lt_handle && _opaque->lt_desc
+-        && _opaque->a_layout && _opaque->b_layout && _opaque->c_layout) {
++        && _opaque->a_layout && _opaque->b_layout && _opaque->c_layout && _opaque->lt_has_algo
++        && workspace_size >= _opaque->lt_workspace) {
++        if (!_opaque->lt_tuned) {
++            _opaque->autotune(_info, a, b, c, &alpha, &beta, workspace, workspace_size,
++                              (cudaStream_t)stream);
++        }
+         auto lt_status = cublasLtMatmul(
+             _opaque->lt_handle,
+             _opaque->lt_desc,
+@@ -224,7 +454,7 @@ infiniStatus_t Descriptor::calculate(
+             _opaque->c_layout,
+             c,
+             _opaque->c_layout,
+-            nullptr,
++            &_opaque->lt_algo,
+             workspace,
+             workspace_size,
+             (cudaStream_t)stream);
+diff --git a/src/infiniop/ops/quant/per_channel_quant_int8/operator.cc b/src/infiniop/ops/quant/per_channel_quant_int8/operator.cc
+index add914b4..ef18a701 100644
+--- a/src/infiniop/ops/quant/per_channel_quant_int8/operator.cc
++++ b/src/infiniop/ops/quant/per_channel_quant_int8/operator.cc
+@@ -31,7 +31,7 @@ __INFINI_C infiniStatus_t infiniopCreatePerChannelQuantI8Descriptor(infiniopHand
+ #ifdef ENABLE_QY_API
+         CREATE(INFINI_DEVICE_QY, nvidia)
+ #endif
+-#ifdef ENABLE_HYGON_API
++#if defined(ENABLE_HYGON_API) && !defined(ENABLE_H3_NINETOOTHED)
+         CREATE(INFINI_DEVICE_HYGON, nvidia)
+ #endif
+ #ifdef ENABLE_MOORE_API
+@@ -55,7 +55,7 @@ __INFINI_C infiniStatus_t infiniopGetPerChannelQuantI8WorkspaceSize(infiniopPerC
+ #ifdef ENABLE_QY_API
+         GET(INFINI_DEVICE_QY, nvidia)
+ #endif
+-#ifdef ENABLE_HYGON_API
++#if defined(ENABLE_HYGON_API) && !defined(ENABLE_H3_NINETOOTHED)
+         GET(INFINI_DEVICE_HYGON, nvidia)
+ #endif
+ #ifdef ENABLE_MOORE_API
+@@ -87,7 +87,7 @@ __INFINI_C infiniStatus_t infiniopPerChannelQuantI8(infiniopPerChannelQuantI8Des
+ #ifdef ENABLE_QY_API
+         QUANT(INFINI_DEVICE_QY, nvidia)
+ #endif
+-#ifdef ENABLE_HYGON_API
++#if defined(ENABLE_HYGON_API) && !defined(ENABLE_H3_NINETOOTHED)
+         QUANT(INFINI_DEVICE_HYGON, nvidia)
+ #endif
+ #ifdef ENABLE_MOORE_API
+@@ -112,7 +112,7 @@ __INFINI_C infiniStatus_t infiniopDestroyPerChannelQuantI8Descriptor(infiniopPer
+ #ifdef ENABLE_QY_API
+         DESTROY(INFINI_DEVICE_QY, nvidia)
+ #endif
+-#ifdef ENABLE_HYGON_API
++#if defined(ENABLE_HYGON_API) && !defined(ENABLE_H3_NINETOOTHED)
+         DESTROY(INFINI_DEVICE_HYGON, nvidia)
+ #endif
+ #ifdef ENABLE_MOORE_API
+diff --git a/src/infiniop/ops/timestep_embedding/nvidia/timestep_embedding_nvidia.cu b/src/infiniop/ops/timestep_embedding/nvidia/timestep_embedding_nvidia.cu
+new file mode 100644
+index 00000000..9766aec5
+--- /dev/null
++++ b/src/infiniop/ops/timestep_embedding/nvidia/timestep_embedding_nvidia.cu
+@@ -0,0 +1,130 @@
++#include "timestep_embedding_nvidia.cuh"
++
++#include "../../../devices/nvidia/nvidia_common.cuh"
++#include "../../../devices/nvidia/nvidia_kernel_common.cuh"
++#include "../../../tensor.h"
++
++#include <cmath>
++#include <cuda_runtime.h>
++
++namespace {
++
++template <typename T>
++INFINIOP_CUDA_KERNEL timestepEmbeddingKernel(
++    float *__restrict__ output,
++    const T *__restrict__ timestep,
++    size_t num_timesteps,
++    size_t embedding_dim,
++    float log_max_period) {
++    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
++    const size_t numel = num_timesteps * embedding_dim;
++    if (index >= numel) {
++        return;
++    }
++
++    const size_t half_dim = embedding_dim / 2;
++    const size_t timestep_index = index / embedding_dim;
++    const size_t output_dim = index % embedding_dim;
++    const size_t frequency_index = output_dim % half_dim;
++    const float frequency = expf(
++        -log_max_period * static_cast<float>(frequency_index)
++        / static_cast<float>(half_dim));
++    const float angle = static_cast<float>(timestep[timestep_index]) * frequency;
++    output[index] = output_dim < half_dim ? cosf(angle) : sinf(angle);
++}
++
++} // namespace
++
++namespace op::timestep_embedding::nvidia {
++
++struct Descriptor::Opaque {
++    std::shared_ptr<device::nvidia::Handle::Internal> internal;
++};
++
++Descriptor::~Descriptor() {
++    delete _opaque;
++}
++
++infiniStatus_t Descriptor::create(
++    infiniopHandle_t handle,
++    Descriptor **desc_ptr,
++    infiniopTensorDescriptor_t output_desc,
++    infiniopTensorDescriptor_t timestep_desc) {
++    CHECK_OR_RETURN(timestep_desc->shape().size() == 1,
++                    INFINI_STATUS_BAD_TENSOR_SHAPE);
++    CHECK_OR_RETURN(output_desc->shape().size() == 2,
++                    INFINI_STATUS_BAD_TENSOR_SHAPE);
++    CHECK_OR_RETURN(output_desc->shape()[0] == timestep_desc->shape()[0]
++                        && output_desc->shape()[1] > 0
++                        && output_desc->shape()[1] % 2 == 0,
++                    INFINI_STATUS_BAD_TENSOR_SHAPE);
++    CHECK_OR_RETURN(output_desc->dtype() == INFINI_DTYPE_F32,
++                    INFINI_STATUS_BAD_TENSOR_DTYPE);
++    CHECK_DTYPE(timestep_desc->dtype(),
++                INFINI_DTYPE_F16, INFINI_DTYPE_BF16, INFINI_DTYPE_F32);
++    CHECK_OR_RETURN(output_desc->isContiguous() && timestep_desc->isContiguous(),
++                    INFINI_STATUS_BAD_TENSOR_STRIDES);
++
++    *desc_ptr = new Descriptor(
++        timestep_desc->shape()[0],
++        output_desc->shape()[1],
++        timestep_desc->dtype(),
++        new Opaque{reinterpret_cast<device::nvidia::Handle *>(handle)->internal()},
++        handle->device,
++        handle->device_id);
++    return INFINI_STATUS_SUCCESS;
++}
++
++infiniStatus_t Descriptor::calculate(
++    void *output,
++    const void *timestep,
++    float max_period,
++    void *stream) const {
++    if (max_period <= 0.0f) {
++        return INFINI_STATUS_BAD_PARAM;
++    }
++    const size_t numel = _num_timesteps * _embedding_dim;
++    if (numel == 0) {
++        return INFINI_STATUS_SUCCESS;
++    }
++
++    constexpr size_t block_size = 256;
++    const size_t grid_size = (numel + block_size - 1) / block_size;
++    const float log_max_period = std::log(max_period);
++    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
++
++    switch (_input_dtype) {
++    case INFINI_DTYPE_F16:
++        timestepEmbeddingKernel<half><<<grid_size, block_size, 0, cuda_stream>>>(
++            reinterpret_cast<float *>(output),
++            reinterpret_cast<const half *>(timestep),
++            _num_timesteps,
++            _embedding_dim,
++            log_max_period);
++        break;
++    case INFINI_DTYPE_BF16:
++        timestepEmbeddingKernel<cuda_bfloat16><<<grid_size, block_size, 0, cuda_stream>>>(
++            reinterpret_cast<float *>(output),
++            reinterpret_cast<const cuda_bfloat16 *>(timestep),
++            _num_timesteps,
++            _embedding_dim,
++            log_max_period);
++        break;
++    case INFINI_DTYPE_F32:
++        timestepEmbeddingKernel<float><<<grid_size, block_size, 0, cuda_stream>>>(
++            reinterpret_cast<float *>(output),
++            reinterpret_cast<const float *>(timestep),
++            _num_timesteps,
++            _embedding_dim,
++            log_max_period);
++        break;
++    default:
++        return INFINI_STATUS_BAD_TENSOR_DTYPE;
++    }
++
++    return cudaGetLastError() == cudaSuccess
++             ? INFINI_STATUS_SUCCESS
++             : INFINI_STATUS_INTERNAL_ERROR;
++}
++
++} // namespace op::timestep_embedding::nvidia
+diff --git a/src/infiniop/ops/timestep_embedding/nvidia/timestep_embedding_nvidia.cuh b/src/infiniop/ops/timestep_embedding/nvidia/timestep_embedding_nvidia.cuh
+new file mode 100644
+index 00000000..f84c8e27
+--- /dev/null
++++ b/src/infiniop/ops/timestep_embedding/nvidia/timestep_embedding_nvidia.cuh
+@@ -0,0 +1,8 @@
++#ifndef __TIMESTEP_EMBEDDING_NVIDIA_CUH__
++#define __TIMESTEP_EMBEDDING_NVIDIA_CUH__
++
++#include "../timestep_embedding.h"
++
++TIMESTEP_EMBEDDING_DESCRIPTOR(nvidia)
++
++#endif
+diff --git a/src/infiniop/ops/timestep_embedding/operator.cc b/src/infiniop/ops/timestep_embedding/operator.cc
+new file mode 100644
+index 00000000..1b1f9f2c
+--- /dev/null
++++ b/src/infiniop/ops/timestep_embedding/operator.cc
+@@ -0,0 +1,86 @@
++#include "../../operator.h"
++#include "../../handle.h"
++#include "infiniop/ops/timestep_embedding.h"
++
++#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_HYGON_API)
++#include "nvidia/timestep_embedding_nvidia.cuh"
++#endif
++
++__INFINI_C infiniStatus_t infiniopCreateTimestepEmbeddingDescriptor(
++    infiniopHandle_t handle,
++    infiniopTimestepEmbeddingDescriptor_t *desc_ptr,
++    infiniopTensorDescriptor_t output_desc,
++    infiniopTensorDescriptor_t timestep_desc) {
++
++#define CREATE(CASE, NAMESPACE)                                                 \
++    case CASE:                                                                  \
++        return op::timestep_embedding::NAMESPACE::Descriptor::create(           \
++            handle,                                                             \
++            reinterpret_cast<op::timestep_embedding::NAMESPACE::Descriptor **>( \
++                desc_ptr),                                                      \
++            output_desc,                                                        \
++            timestep_desc)
++
++    switch (handle->device) {
++#ifdef ENABLE_NVIDIA_API
++        CREATE(INFINI_DEVICE_NVIDIA, nvidia);
++#endif
++#ifdef ENABLE_HYGON_API
++        CREATE(INFINI_DEVICE_HYGON, nvidia);
++#endif
++    default:
++        return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
++    }
++
++#undef CREATE
++}
++
++__INFINI_C infiniStatus_t infiniopTimestepEmbedding(
++    infiniopTimestepEmbeddingDescriptor_t desc,
++    void *output,
++    const void *timestep,
++    float max_period,
++    void *stream) {
++
++#define CALCULATE(CASE, NAMESPACE)                                              \
++    case CASE:                                                                  \
++        return reinterpret_cast<                                                \
++                   const op::timestep_embedding::NAMESPACE::Descriptor *>(desc) \
++            ->calculate(output, timestep, max_period, stream)
++
++    switch (desc->device_type) {
++#ifdef ENABLE_NVIDIA_API
++        CALCULATE(INFINI_DEVICE_NVIDIA, nvidia);
++#endif
++#ifdef ENABLE_HYGON_API
++        CALCULATE(INFINI_DEVICE_HYGON, nvidia);
++#endif
++    default:
++        return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
++    }
++
++#undef CALCULATE
++}
++
++__INFINI_C infiniStatus_t infiniopDestroyTimestepEmbeddingDescriptor(
++    infiniopTimestepEmbeddingDescriptor_t desc) {
++
++#define DESTROY(CASE, NAMESPACE)                                          \
++    case CASE:                                                            \
++        delete reinterpret_cast<                                          \
++            const op::timestep_embedding::NAMESPACE::Descriptor *>(desc); \
++        return INFINI_STATUS_SUCCESS
++
++    switch (desc->device_type) {
++#ifdef ENABLE_NVIDIA_API
++        DESTROY(INFINI_DEVICE_NVIDIA, nvidia);
++#endif
++#ifdef ENABLE_HYGON_API
++        DESTROY(INFINI_DEVICE_HYGON, nvidia);
++#endif
++    default:
++        return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
++    }
++
++#undef DESTROY
++}
+diff --git a/src/infiniop/ops/timestep_embedding/timestep_embedding.h b/src/infiniop/ops/timestep_embedding/timestep_embedding.h
+new file mode 100644
+index 00000000..8711dbd6
+--- /dev/null
++++ b/src/infiniop/ops/timestep_embedding/timestep_embedding.h
+@@ -0,0 +1,47 @@
++#ifndef __TIMESTEP_EMBEDDING_H__
++#define __TIMESTEP_EMBEDDING_H__
++
++#include "../../../utils.h"
++#include "../../operator.h"
++
++#define TIMESTEP_EMBEDDING_DESCRIPTOR(NAMESPACE)          \
++                                                          \
++    namespace op::timestep_embedding::NAMESPACE {         \
++    class Descriptor final : public InfiniopDescriptor {  \
++        struct Opaque;                                    \
++        Opaque *_opaque;                                  \
++        size_t _num_timesteps;                            \
++        size_t _embedding_dim;                            \
++        infiniDtype_t _input_dtype;                       \
++                                                          \
++        Descriptor(                                       \
++            size_t num_timesteps,                         \
++            size_t embedding_dim,                         \
++            infiniDtype_t input_dtype,                    \
++            Opaque *opaque,                               \
++            infiniDevice_t device_type,                   \
++            int device_id)                                \
++            : InfiniopDescriptor{device_type, device_id}, \
++              _opaque(opaque),                            \
++              _num_timesteps(num_timesteps),              \
++              _embedding_dim(embedding_dim),              \
++              _input_dtype(input_dtype) {}                \
++                                                          \
++    public:                                               \
++        ~Descriptor();                                    \
++                                                          \
++        static infiniStatus_t create(                     \
++            infiniopHandle_t handle,                      \
++            Descriptor **desc_ptr,                        \
++            infiniopTensorDescriptor_t output_desc,       \
++            infiniopTensorDescriptor_t timestep_desc);    \
++                                                          \
++        infiniStatus_t calculate(                         \
++            void *output,                                 \
++            const void *timestep,                         \
++            float max_period,                             \
++            void *stream) const;                          \
++    };                                                    \
++    }
++
++#endif
+diff --git a/src/infiniop/ops/upsample_bilinear/cpu/upsample_bilinear_cpu.cc b/src/infiniop/ops/upsample_bilinear/cpu/upsample_bilinear_cpu.cc
+index 5f0ffe0c..084c817c 100644
+--- a/src/infiniop/ops/upsample_bilinear/cpu/upsample_bilinear_cpu.cc
++++ b/src/infiniop/ops/upsample_bilinear/cpu/upsample_bilinear_cpu.cc
+@@ -2,6 +2,7 @@
+ #include "../../../devices/cpu/common_cpu.h"
+ #include <algorithm>
+ #include <cmath>
++#include <cstddef>
+ #include <omp.h>
+ #include <vector>
+ 
+@@ -104,6 +105,14 @@ void calculate_cpu_impl(
+     size_t out_h = info.h_out();
+     size_t out_w = info.w_out();
+     bool align_corners = info.align_corners();
++    const ptrdiff_t input_stride_n = info.input_stride(0);
++    const ptrdiff_t input_stride_c = info.input_stride(1);
++    const ptrdiff_t input_stride_h = info.input_stride(2);
++    const ptrdiff_t input_stride_w = info.input_stride(3);
++    const ptrdiff_t output_stride_n = info.output_stride(0);
++    const ptrdiff_t output_stride_c = info.output_stride(1);
++    const ptrdiff_t output_stride_h = info.output_stride(2);
++    const ptrdiff_t output_stride_w = info.output_stride(3);
+ 
+     auto out_ptr = reinterpret_cast<T *>(output);
+     auto in_ptr = reinterpret_cast<const T *>(input);
+@@ -116,24 +125,24 @@ void calculate_cpu_impl(
+ 
+ #pragma omp parallel for schedule(static)
+     for (ptrdiff_t nc = 0; nc < (ptrdiff_t)n_c; ++nc) {
+-        // 当前 channel 的输入输出起始指针
+-        const T *src_base = in_ptr + nc * in_h * in_w;
+-        T *dst_base = out_ptr + nc * out_h * out_w;
++        const size_t n = static_cast<size_t>(nc) / C;
++        const size_t c = static_cast<size_t>(nc) % C;
++        const ptrdiff_t input_base = n * input_stride_n + c * input_stride_c;
++        const ptrdiff_t output_base = n * output_stride_n + c * output_stride_c;
+ 
+         for (size_t h = 0; h < out_h; ++h) {
+             const auto &hp = h_params[h];
+-            // 缓存行指针，避免内层循环重复计算乘法
+-            const T *src_row0 = src_base + hp.idx0 * in_w;
+-            const T *src_row1 = src_base + hp.idx1 * in_w;
++            const ptrdiff_t row0 = input_base + hp.idx0 * input_stride_h;
++            const ptrdiff_t row1 = input_base + hp.idx1 * input_stride_h;
+ 
+             for (size_t w = 0; w < out_w; ++w) {
+                 const auto &wp = w_params[w];
+ 
+                 // 获取四个采样点的值
+-                float val00 = utils::cast<float>(src_row0[wp.idx0]);
+-                float val01 = utils::cast<float>(src_row0[wp.idx1]);
+-                float val10 = utils::cast<float>(src_row1[wp.idx0]);
+-                float val11 = utils::cast<float>(src_row1[wp.idx1]);
++                float val00 = utils::cast<float>(in_ptr[row0 + wp.idx0 * input_stride_w]);
++                float val01 = utils::cast<float>(in_ptr[row0 + wp.idx1 * input_stride_w]);
++                float val10 = utils::cast<float>(in_ptr[row1 + wp.idx0 * input_stride_w]);
++                float val11 = utils::cast<float>(in_ptr[row1 + wp.idx1 * input_stride_w]);
+ 
+                 // 双线性插值计算
+                 // interpolation = (val00 * w0 + val01 * w1) * h_w0 + (val10 * w0 + val11 * w1) * h_w1
+@@ -141,7 +150,7 @@ void calculate_cpu_impl(
+                 float val_h1 = val10 * wp.w0 + val11 * wp.w1;
+                 float result = val_h0 * hp.w0 + val_h1 * hp.w1;
+ 
+-                dst_base[h * out_w + w] = utils::cast<T>(result);
++                out_ptr[output_base + h * output_stride_h + w * output_stride_w] = utils::cast<T>(result);
+             }
+         }
+     }
+diff --git a/src/infiniop/ops/upsample_bilinear/cuda/kernel.cuh b/src/infiniop/ops/upsample_bilinear/cuda/kernel.cuh
+index 8ab3358b..e9731d77 100644
+--- a/src/infiniop/ops/upsample_bilinear/cuda/kernel.cuh
++++ b/src/infiniop/ops/upsample_bilinear/cuda/kernel.cuh
+@@ -2,6 +2,7 @@
+ #define __UPSAMPLE_BILINEAR_CUDA_CUH__
+ 
+ #include <cmath>
++#include <cstddef>
+ #include <cstdio>
+ 
+ namespace op::upsample_bilinear::cuda {
+@@ -39,6 +40,14 @@ __global__ void upsample_bilinear_kernel(
+     size_t W_in,
+     size_t H_out,
+     size_t W_out,
++    ptrdiff_t input_stride_n,
++    ptrdiff_t input_stride_c,
++    ptrdiff_t input_stride_h,
++    ptrdiff_t input_stride_w,
++    ptrdiff_t output_stride_n,
++    ptrdiff_t output_stride_c,
++    ptrdiff_t output_stride_h,
++    ptrdiff_t output_stride_w,
+     float scale_h, // 预计算的缩放比例
+     float scale_w, // 预计算的缩放比例
+     bool align_corners) {
+@@ -82,20 +91,19 @@ __global__ void upsample_bilinear_kernel(
+         w0 = clamp(w0, 0, static_cast<int>(W_in) - 1);
+         w1 = clamp(w1, 0, static_cast<int>(W_in) - 1);
+ 
+-        // 6. 读取数据
+-        // 计算当前 Batch 和 Channel 的 Input 基地址
+-        const T *img_base = input + (n_idx * C + c_idx) * H_in * W_in;
+-
+-        float val00 = static_cast<float>(img_base[h0 * W_in + w0]);
+-        float val01 = static_cast<float>(img_base[h0 * W_in + w1]);
+-        float val10 = static_cast<float>(img_base[h1 * W_in + w0]);
+-        float val11 = static_cast<float>(img_base[h1 * W_in + w1]);
++        const ptrdiff_t input_base = n_idx * input_stride_n + c_idx * input_stride_c;
++        float val00 = static_cast<float>(input[input_base + h0 * input_stride_h + w0 * input_stride_w]);
++        float val01 = static_cast<float>(input[input_base + h0 * input_stride_h + w1 * input_stride_w]);
++        float val10 = static_cast<float>(input[input_base + h1 * input_stride_h + w0 * input_stride_w]);
++        float val11 = static_cast<float>(input[input_base + h1 * input_stride_h + w1 * input_stride_w]);
+ 
+         // 7. 双线性插值计算
+         // result = (val00 * w0 + val01 * w1) * h0 + (val10 * w0 + val11 * w1) * h1
+         float val = h0_lambda * (w0_lambda * val00 + w1_lambda * val01) + h1_lambda * (w0_lambda * val10 + w1_lambda * val11);
+ 
+-        output[i] = static_cast<T>(val);
++        const ptrdiff_t output_offset = n_idx * output_stride_n + c_idx * output_stride_c
++                                      + h_out_idx * output_stride_h + w_out_idx * output_stride_w;
++        output[output_offset] = static_cast<T>(val);
+     }
+ }
+ 
+diff --git a/src/infiniop/ops/upsample_bilinear/info.h b/src/infiniop/ops/upsample_bilinear/info.h
+index e1d3f9eb..7e6854b6 100644
+--- a/src/infiniop/ops/upsample_bilinear/info.h
++++ b/src/infiniop/ops/upsample_bilinear/info.h
+@@ -3,6 +3,8 @@
+ 
+ #include "../../../utils.h"
+ #include "../../tensor.h"
++#include <array>
++#include <cstddef>
+ #include <vector>
+ 
+ namespace op::upsample_bilinear {
+@@ -23,6 +25,8 @@ public:
+     size_t _w_in;  // Input Width
+     size_t _h_out; // Output Height
+     size_t _w_out; // Output Width
++    std::array<ptrdiff_t, 4> _input_strides;
++    std::array<ptrdiff_t, 4> _output_strides;
+ 
+     int dtype() const { return _dtype; }
+     bool align_corners() const { return _align_corners; }
+@@ -32,16 +36,22 @@ public:
+     size_t w_in() const { return _w_in; }
+     size_t h_out() const { return _h_out; }
+     size_t w_out() const { return _w_out; }
++    ptrdiff_t input_stride(size_t dim) const { return _input_strides[dim]; }
++    ptrdiff_t output_stride(size_t dim) const { return _output_strides[dim]; }
+ 
+     // 构造函数
+     UpsampleBilinearInfo(int dtype, bool align_corners,
+                          size_t n, size_t c,
+                          size_t h_in, size_t w_in,
+-                         size_t h_out, size_t w_out)
++                         size_t h_out, size_t w_out,
++                         std::array<ptrdiff_t, 4> input_strides,
++                         std::array<ptrdiff_t, 4> output_strides)
+         : _dtype(dtype), _align_corners(align_corners),
+           _n(n), _c(c),
+           _h_in(h_in), _w_in(w_in),
+-          _h_out(h_out), _w_out(w_out) {}
++          _h_out(h_out), _w_out(w_out),
++          _input_strides(input_strides),
++          _output_strides(output_strides) {}
+ 
+     static utils::Result<UpsampleBilinearInfo> create(
+         infiniopTensorDescriptor_t out_desc,
+@@ -49,10 +59,9 @@ public:
+         int align_corners) { // C 接口通常传入 int 替代 bool
+ 
+         // 1. 检查维度数量
+-        // 至少需要 2 维 (H, W)
+-        // 修复: 使用 size_t 避免与 ndim() 返回值比较时的 signed/unsigned 警告
++        // Normalize [H, W], [C, H, W], and [N, C, H, W] to NCHW.
+         size_t ndim = input_desc->ndim();
+-        if (ndim < 2) {
++        if (ndim < 2 || ndim > 4) {
+             return INFINI_STATUS_BAD_TENSOR_SHAPE;
+         }
+         if (out_desc->ndim() != ndim) {
+@@ -67,32 +76,21 @@ public:
+ 
+         // 3. 检查 Batch/Channel 维度一致性
+         // 除了最后两维 (H, W)，前面的维度必须完全匹配
+-        size_t n = 1;
+-        size_t c = 1;
+-
+-        // 解析 N 和 C 用于 Info 缓存
+-        // 逻辑：
+-        // ndim = 4: [N, C, H, W] -> n=dims[0], c=dims[1]
+-        // ndim = 3: [C, H, W]    -> n=1,       c=dims[0]
+-        // ndim = 2: [H, W]       -> n=1,       c=1
+-        // 其他情况将所有非 spatial 维度累乘到 c 中 (视为 flattened channels)
+-
+-        for (size_t i = 0; i < ndim - 2; ++i) { // 循环变量 i 也建议改为 size_t
++        for (size_t i = 0; i < ndim - 2; ++i) {
+             if (input_desc->shape()[i] != out_desc->shape()[i]) {
+                 return INFINI_STATUS_BAD_TENSOR_SHAPE;
+             }
++        }
+ 
+-            // 简单 heuristic 来填充 n 和 c
+-            if (ndim == 4 && i == 0) {
+-                n = input_desc->shape()[i];
+-            } else if (ndim == 4 && i == 1) {
+-                c = input_desc->shape()[i];
+-            } else if (ndim == 3 && i == 0) {
+-                c = input_desc->shape()[i];
+-            } else {
+-                // 对于 >4 维的情况，简单地归约为 c
+-                c *= input_desc->shape()[i];
+-            }
++        size_t n = ndim == 4 ? input_desc->shape()[0] : 1;
++        size_t c = ndim == 4 ? input_desc->shape()[1]
++                             : (ndim == 3 ? input_desc->shape()[0] : 1);
++        std::array<ptrdiff_t, 4> input_strides{0, 0, 0, 0};
++        std::array<ptrdiff_t, 4> output_strides{0, 0, 0, 0};
++        const size_t stride_offset = 4 - ndim;
++        for (size_t i = 0; i < ndim; ++i) {
++            input_strides[stride_offset + i] = input_desc->strides()[i];
++            output_strides[stride_offset + i] = out_desc->strides()[i];
+         }
+ 
+         // 4. 获取空间维度
+@@ -114,7 +112,9 @@ public:
+             h_in,
+             w_in,
+             h_out,
+-            w_out});
++            w_out,
++            input_strides,
++            output_strides});
+     }
+ };
+ 
+diff --git a/src/infiniop/ops/upsample_bilinear/metax/upsample_bilinear_metax.maca b/src/infiniop/ops/upsample_bilinear/metax/upsample_bilinear_metax.maca
+index ccafac3e..0e182ad5 100644
+--- a/src/infiniop/ops/upsample_bilinear/metax/upsample_bilinear_metax.maca
++++ b/src/infiniop/ops/upsample_bilinear/metax/upsample_bilinear_metax.maca
+@@ -5,6 +5,7 @@
+ #include "upsample_bilinear_metax.h"
+ #include <algorithm>
+ #include <cmath>
++#include <cstddef>
+ #include <cstdio>
+ 
+ namespace op::upsample_bilinear::metax {
+@@ -60,6 +61,14 @@ __global__ void upsample_bilinear_kernel(
+     size_t W_in,
+     size_t H_out,
+     size_t W_out,
++    ptrdiff_t input_stride_n,
++    ptrdiff_t input_stride_c,
++    ptrdiff_t input_stride_h,
++    ptrdiff_t input_stride_w,
++    ptrdiff_t output_stride_n,
++    ptrdiff_t output_stride_c,
++    ptrdiff_t output_stride_h,
++    ptrdiff_t output_stride_w,
+     float scale_h, // 预计算的缩放比例
+     float scale_w, // 预计算的缩放比例
+     bool align_corners) {
+@@ -101,18 +110,18 @@ __global__ void upsample_bilinear_kernel(
+         w0 = clamp(w0, 0, static_cast<int>(W_in) - 1);
+         w1 = clamp(w1, 0, static_cast<int>(W_in) - 1);
+ 
+-        // 6. 读取数据并转换为 float
+-        const T *img_base = input + (n_idx * C + c_idx) * H_in * W_in;
+-
+-        float val00 = to_float(img_base[h0 * W_in + w0]);
+-        float val01 = to_float(img_base[h0 * W_in + w1]);
+-        float val10 = to_float(img_base[h1 * W_in + w0]);
+-        float val11 = to_float(img_base[h1 * W_in + w1]);
++        const ptrdiff_t input_base = n_idx * input_stride_n + c_idx * input_stride_c;
++        float val00 = to_float(input[input_base + h0 * input_stride_h + w0 * input_stride_w]);
++        float val01 = to_float(input[input_base + h0 * input_stride_h + w1 * input_stride_w]);
++        float val10 = to_float(input[input_base + h1 * input_stride_h + w0 * input_stride_w]);
++        float val11 = to_float(input[input_base + h1 * input_stride_h + w1 * input_stride_w]);
+ 
+         // 7. 双线性插值计算
+         float val = h0_lambda * (w0_lambda * val00 + w1_lambda * val01) + h1_lambda * (w0_lambda * val10 + w1_lambda * val11);
+ 
+-        output[i] = static_cast<T>(val);
++        const ptrdiff_t output_offset = n_idx * output_stride_n + c_idx * output_stride_c
++                                      + h_out_idx * output_stride_h + w_out_idx * output_stride_w;
++        output[output_offset] = static_cast<T>(val);
+     }
+ }
+ 
+@@ -165,6 +174,10 @@ void launch_kernel(
+             out_ptr,
+             in_ptr,
+             N, C, H_in, W_in, H_out, W_out,
++            info.input_stride(0), info.input_stride(1),
++            info.input_stride(2), info.input_stride(3),
++            info.output_stride(0), info.output_stride(1),
++            info.output_stride(2), info.output_stride(3),
+             scale_h, scale_w,
+             align_corners);
+ }
+diff --git a/src/infiniop/ops/upsample_bilinear/moore/upsample_bilinear_moore.mu b/src/infiniop/ops/upsample_bilinear/moore/upsample_bilinear_moore.mu
+index 546765c6..3dd9ad1a 100644
+--- a/src/infiniop/ops/upsample_bilinear/moore/upsample_bilinear_moore.mu
++++ b/src/infiniop/ops/upsample_bilinear/moore/upsample_bilinear_moore.mu
+@@ -56,6 +56,10 @@ void launch_kernel(
+             out_ptr,
+             in_ptr,
+             N, C, H_in, W_in, H_out, W_out,
++            info.input_stride(0), info.input_stride(1),
++            info.input_stride(2), info.input_stride(3),
++            info.output_stride(0), info.output_stride(1),
++            info.output_stride(2), info.output_stride(3),
+             scale_h, scale_w,
+             align_corners);
+ }
+diff --git a/src/infiniop/ops/upsample_bilinear/moore/upsample_bilinear_moore_kernel.h b/src/infiniop/ops/upsample_bilinear/moore/upsample_bilinear_moore_kernel.h
+index e2ef3b02..b1105e41 100644
+--- a/src/infiniop/ops/upsample_bilinear/moore/upsample_bilinear_moore_kernel.h
++++ b/src/infiniop/ops/upsample_bilinear/moore/upsample_bilinear_moore_kernel.h
+@@ -2,6 +2,7 @@
+ #define __UPSAMPLE_BILINEAR_MOORE_H__
+ 
+ #include <cmath>
++#include <cstddef>
+ #include <cstdio>
+ #include <musa_bf16.h>
+ #include <musa_fp16.h>
+@@ -33,6 +34,14 @@ __global__ void upsample_bilinear_kernel(
+     size_t W_in,
+     size_t H_out,
+     size_t W_out,
++    ptrdiff_t input_stride_n,
++    ptrdiff_t input_stride_c,
++    ptrdiff_t input_stride_h,
++    ptrdiff_t input_stride_w,
++    ptrdiff_t output_stride_n,
++    ptrdiff_t output_stride_c,
++    ptrdiff_t output_stride_h,
++    ptrdiff_t output_stride_w,
+     float scale_h,
+     float scale_w,
+     bool align_corners) {
+@@ -67,16 +76,17 @@ __global__ void upsample_bilinear_kernel(
+         w0 = clamp(w0, 0, static_cast<int>(W_in) - 1);
+         w1 = clamp(w1, 0, static_cast<int>(W_in) - 1);
+ 
+-        const T *img_base = input + (n_idx * C + c_idx) * H_in * W_in;
+-
+-        float val00 = static_cast<float>(img_base[h0 * W_in + w0]);
+-        float val01 = static_cast<float>(img_base[h0 * W_in + w1]);
+-        float val10 = static_cast<float>(img_base[h1 * W_in + w0]);
+-        float val11 = static_cast<float>(img_base[h1 * W_in + w1]);
++        const ptrdiff_t input_base = n_idx * input_stride_n + c_idx * input_stride_c;
++        float val00 = static_cast<float>(input[input_base + h0 * input_stride_h + w0 * input_stride_w]);
++        float val01 = static_cast<float>(input[input_base + h0 * input_stride_h + w1 * input_stride_w]);
++        float val10 = static_cast<float>(input[input_base + h1 * input_stride_h + w0 * input_stride_w]);
++        float val11 = static_cast<float>(input[input_base + h1 * input_stride_h + w1 * input_stride_w]);
+ 
+         float val = h0_lambda * (w0_lambda * val00 + w1_lambda * val01) + h1_lambda * (w0_lambda * val10 + w1_lambda * val11);
+ 
+-        output[i] = static_cast<T>(val);
++        const ptrdiff_t output_offset = n_idx * output_stride_n + c_idx * output_stride_c
++                                      + h_out_idx * output_stride_h + w_out_idx * output_stride_w;
++        output[output_offset] = static_cast<T>(val);
+     }
+ }
+ 
+diff --git a/src/infiniop/ops/upsample_bilinear/nvidia/upsample_bilinear_nvidia.cu b/src/infiniop/ops/upsample_bilinear/nvidia/upsample_bilinear_nvidia.cu
+index d7ee074f..305101e9 100644
+--- a/src/infiniop/ops/upsample_bilinear/nvidia/upsample_bilinear_nvidia.cu
++++ b/src/infiniop/ops/upsample_bilinear/nvidia/upsample_bilinear_nvidia.cu
+@@ -70,6 +70,10 @@ void launch_kernel(
+             out_ptr,
+             in_ptr,
+             N, C, H_in, W_in, H_out, W_out,
++            info.input_stride(0), info.input_stride(1),
++            info.input_stride(2), info.input_stride(3),
++            info.output_stride(0), info.output_stride(1),
++            info.output_stride(2), info.output_stride(3),
+             scale_h, scale_w,
+             align_corners);
+ }
+diff --git a/test/infinicore/ops/timestep_embedding.py b/test/infinicore/ops/timestep_embedding.py
+new file mode 100644
+index 00000000..983f1882
+--- /dev/null
++++ b/test/infinicore/ops/timestep_embedding.py
+@@ -0,0 +1,84 @@
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import torch
++from framework import BaseOperatorTest, GenericTestRunner, TensorSpec, TestCase
++
++import infinicore
++
++_TIMESTEP_SHAPES = [(1,), (4,), (17,)]
++_EMBEDDING_DIMS = [16, 256]
++_INPUT_DTYPES = [infinicore.float16, infinicore.bfloat16, infinicore.float32]
++
++
++class OpTest(BaseOperatorTest):
++    def __init__(self):
++        super().__init__("TimestepEmbedding")
++
++    def get_test_cases(self):
++        cases = []
++        for shape in _TIMESTEP_SHAPES:
++            for embedding_dim in _EMBEDDING_DIMS:
++                for dtype in _INPUT_DTYPES:
++                    cases.append(
++                        TestCase(
++                            inputs=[TensorSpec.from_tensor(shape, None, dtype)],
++                            kwargs={
++                                "embedding_dim": embedding_dim,
++                                "max_period": 10000.0,
++                            },
++                            output_spec=None,
++                            comparison_target=None,
++                            tolerance={"atol": 2e-5, "rtol": 2e-5},
++                            description="TimestepEmbedding - OUT_OF_PLACE",
++                        )
++                    )
++        return cases
++
++    def torch_operator(
++        self,
++        timestep,
++        embedding_dim=256,
++        max_period=10000.0,
++        out=None,
++    ):
++        half_dim = embedding_dim // 2
++        exponent = (
++            -torch.log(torch.tensor(max_period))
++            * torch.arange(
++                half_dim,
++                dtype=torch.float32,
++                device=timestep.device,
++            )
++            / half_dim
++        )
++        angles = timestep.float().unsqueeze(1) * exponent.exp().unsqueeze(0)
++        result = torch.cat((angles.cos(), angles.sin()), dim=1)
++        if out is not None:
++            out.copy_(result)
++            return out
++        return result
++
++    def infinicore_operator(
++        self,
++        timestep,
++        embedding_dim=256,
++        max_period=10000.0,
++        out=None,
++    ):
++        return infinicore.timestep_embedding(
++            timestep,
++            embedding_dim,
++            max_period,
++            out=out,
++        )
++
++
++def main():
++    GenericTestRunner(OpTest).run_and_exit()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test/infinicore/ops/upsample_bilinear.py b/test/infinicore/ops/upsample_bilinear.py
+index b6871c8a..ba5bfd54 100644
+--- a/test/infinicore/ops/upsample_bilinear.py
++++ b/test/infinicore/ops/upsample_bilinear.py
+@@ -1,18 +1,18 @@
+-import sys
+ import os
++import sys
+ 
+ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+ 
+-import infinicore
+ import torch
+ from framework import (
+     BaseOperatorTest,
++    GenericTestRunner,
+     TensorSpec,
+     TestCase,
+-    GenericTestRunner,
+-    is_broadcast,
+ )
+ 
++import infinicore
++
+ # Test cases format: (shape, size_or_scale_factor, align_corners_or_None, input_strides_or_None)
+ # infinicore.nn.functional.upsample_bilinear is deprecated in favor of interpolate(mode='bilinear')
+ 
+@@ -23,6 +23,8 @@ _TEST_CASES_DATA = [
+     ((2, 3, 6, 6), (12, 12), None, None),
+     ((4, 3, 7, 7), 2.0, False, None),
+     ((3, 3, 5, 5), (10, 10), True, None),
++    # Channel-first view of a contiguous NHWC tensor, as used by Qwen3-VL.
++    ((1, 8, 4, 4), (6, 8), True, (128, 1, 32, 8)),
+ ]
+ 
+ _TOLERANCE_MAP = {
+@@ -58,7 +60,7 @@ def parse_test_cases():
+                     output_spec=None,
+                     comparison_target=None,
+                     tolerance=tol,
+-                    description=f"upsample_bilinear - OUT_OF_PLACE",
++                    description="upsample_bilinear - OUT_OF_PLACE",
+                 )
+             )
+ 
+diff --git a/xmake.lua b/xmake.lua
+index 56841028..6182ac3b 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -1,6 +1,18 @@
+ add_rules("mode.debug", "mode.release")
+-add_requires("boost", {configs = {stacktrace = true}})
+-add_requires("pybind11")
++-- No target uses Boost. Avoid an unused online package resolution during offline builds.
++if os.getenv("H3_OFFLINE_BUILD") == "1" then
++    local pybind_include = os.getenv("H3_PYBIND11_INCLUDE")
++    if not pybind_include or pybind_include == "" then
++        raise("H3_OFFLINE_BUILD requires H3_PYBIND11_INCLUDE from the installed pybind11 wheel")
++    end
++    local python_include = os.getenv("H3_PYTHON_INCLUDE")
++    if not python_include or python_include == "" then
++        raise("H3_OFFLINE_BUILD requires H3_PYTHON_INCLUDE from Python sysconfig")
++    end
++    add_includedirs(pybind_include, python_include)
++else
++    add_requires("pybind11")
++end
+ 
+ -- Define color codes
+ local GREEN = '\27[0;32m'
+@@ -248,6 +260,19 @@ if has_config("kunlun-xpu") then
+ end
+ 
+ -- 九齿
++option("h3-ninetoothed")
++    set_default(false)
++    set_showmenu(true)
++    set_description("Build H3 noncausal BF16 HIP AOT attention generated by NineToothed")
++option_end()
++
++if has_config("h3-ninetoothed") then
++    if not has_config("hygon-dcu") then
++        raise("h3-ninetoothed requires hygon-dcu")
++    end
++    add_defines("ENABLE_H3_NINETOOTHED")
++end
++
+ option("ninetoothed")
+     set_default(false)
+     set_showmenu(true)
+@@ -855,7 +880,7 @@ target("infinicore_cpp_api")
+     -- pybind11/embed.h for mha_kvcache branch
+     if has_config("moore-gpu") and has_config("aten") and has_config("flash-attn") then
+         add_defines("ENABLE_MOORE_MATE_FLASH_ATTN")
+-        add_packages("pybind11")
++        if os.getenv("H3_OFFLINE_BUILD") ~= "1" then add_packages("pybind11") end
+     end
+ 
+     before_build(function (target)
+@@ -1049,6 +1074,11 @@ target("infinicore_cpp_api")
+     add_files("src/infinicore/ops/*/*.cc")
+     add_files("src/infinicore/ops/*/*/*.cc")
+     add_files("src/infinicore/ops/*/*/*/*.cc")
++    if has_config("h3-ninetoothed") then
++        add_includedirs("build/h3_ninetoothed")
++        add_files("build/h3_ninetoothed/*.hip.cpp")
++        add_links("amdhip64")
++    end
+     -- Platform-private Hygon sources are guarded and only kept in Hygon builds.
+     if has_config("hygon-dcu") and get_config("flash-attn") and get_config("flash-attn") ~= "" then
+         -- Hygon links against a prebuilt flash-attn extension with a different ABI.
+@@ -1086,7 +1116,7 @@ target("_infinicore")
+ 
+     set_default(false)
+     add_rules("python.library", {soabi = true})
+-    add_packages("pybind11")
++    if os.getenv("H3_OFFLINE_BUILD") ~= "1" then add_packages("pybind11") end
+     set_languages("cxx17")
+ 
+     add_deps("infinicore_cpp_api")
+diff --git a/xmake/hygon.lua b/xmake/hygon.lua
+index ba06ae97..69d910d5 100644
+--- a/xmake/hygon.lua
++++ b/xmake/hygon.lua
+@@ -132,7 +132,6 @@ target("infiniop-hygon")
+     add_cuflags("-Wno-error=unused-variable", {force = true})
+     add_cuflags("-Wno-error=unused-function", {force = true})
+     add_cuflags("-Wno-error=int-to-void-pointer-cast", {force = true})
+-    add_cuflags("-Xclang", "-fno-cuda-host-device-constexpr", {force = true})
+     add_cuflags("-fPIC", "-std=c++17", {force = true})
+     add_culdflags("-fPIC")
+     add_cxflags("-fPIC")
+@@ -145,7 +144,10 @@ target("infiniop-hygon")
+ 
+     -- 复用NVIDIA的CUDA实现，通过HIP兼容层
+     add_files("../src/infiniop/devices/nvidia/*.cu", "../src/infiniop/ops/*/nvidia/*.cu")
+-    add_files("../src/infiniop/ops/quant/per_channel_quant_int8/nvidia/*.cu")
++    -- H3 contest path forbids quantization and does not use this optional operator.
++    if not has_config("h3-ninetoothed") then
++        add_files("../src/infiniop/ops/quant/per_channel_quant_int8/nvidia/*.cu")
++    end
+ 
+     -- Keep platform-specific or currently unregistered NVIDIA sources out of the Hygon target.
+     remove_files("../src/infiniop/ops/avg_pool3d/nvidia/*.cu")
+@@ -181,7 +183,6 @@ target("infinirt-hygon")
+     add_cuflags("-Wno-error=unused-variable", {force = true})
+     add_cuflags("-Wno-error=unused-function", {force = true})
+     add_cuflags("-Wno-error=int-to-void-pointer-cast", {force = true})
+-    add_cuflags("-Xclang", "-fno-cuda-host-device-constexpr", {force = true})
+     add_cuflags("-fPIC", "-std=c++17", {force = true})
+     add_culdflags("-fPIC")
+     add_cxflags("-fPIC")
+@@ -214,7 +215,6 @@ target("infiniccl-hygon")
+         add_cuflags("-Wno-error=unused-variable", {force = true})
+         add_cuflags("-Wno-error=unused-function", {force = true})
+         add_cuflags("-Wno-error=int-to-void-pointer-cast", {force = true})
+-        add_cuflags("-Xclang", "-fno-cuda-host-device-constexpr", {force = true})
+         add_cuflags("-fPIC", "-std=c++17", {force = true})
+         add_culdflags("-fPIC")
+         add_cxflags("-fPIC")
+@@ -222,7 +222,7 @@ target("infiniccl-hygon")
+ 
+         -- 添加海光DCU特定的编译标志
+         -- 检测实际GPU架构，如果未指定则默认使用gfx906
+-        local hygon_arch = os.getenv("HYGON_ARCH") or "gfx906"
++        local hygon_arch = HYGON_ARCH
+         add_cuflags("-arch=" .. hygon_arch)
+ 
+         -- 使用NCCL (NVIDIA Collective Communications Library)
+@@ -289,7 +289,7 @@ target("infinicore_cpp_api")
+         add_defines("ENABLE_ATEN")
+         if FLASH_ATTN_ROOT and FLASH_ATTN_ROOT ~= "" then
+             add_defines("ENABLE_FLASH_ATTN")
+-            add_packages("pybind11")
++            if os.getenv("H3_OFFLINE_BUILD") ~= "1" then add_packages("pybind11") end
+         end
+     end
+ 
+@@ -301,9 +301,16 @@ target("infinicore_cpp_api")
+             local flash_dir_hygon = path.directory(flash_so_hygon)
+             local flash_name_hygon = path.filename(flash_so_hygon)
+             local flash_lib_dir_hygon = path.join(FLASH_ATTN_ROOT, "flash_attn", "lib")
++            -- Some DAS wheels embed all attention code in the Python extension.
++            -- Only newer split wheels ship the auxiliary library.
++            if os.isfile(path.join(flash_lib_dir_hygon, "libflash_attention.so")) then
++                target:add("shflags",
++                    "-Wl,--no-as-needed -L" .. flash_lib_dir_hygon .. " -l:libflash_attention.so -Wl,-rpath," .. flash_lib_dir_hygon,
++                    {force = true})
++            end
+             target:add(
+                 "shflags",
+-                "-Wl,--no-as-needed -L" .. flash_lib_dir_hygon .. " -l:libflash_attention.so -Wl,-rpath," .. flash_lib_dir_hygon,
++                "-Wl,--no-as-needed",
+                 "-L" .. flash_dir_hygon .. " -l:" .. flash_name_hygon .. " -Wl,-rpath," .. flash_dir_hygon,
+                 {force = true}
+             )

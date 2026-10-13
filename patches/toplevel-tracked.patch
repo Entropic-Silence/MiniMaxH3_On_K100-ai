@@ -1,0 +1,2562 @@
+diff --git a/README.md b/README.md
+index 818c819..d21fab5 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # 在 4×K100-AI 上把 MiniMax-H3 视频生成从 22 分钟压到 6 分钟：镜像使用手册
+ 
+-> 一句话：这个镜像里是为 **4 张海光 K100-AI** 调到极致的 MiniMax-H3 原生推理（InfiniLM + InfiniCore + 九齿 NineToothed）。准备好模型后，一条命令就能从“首帧 + 文本”生成 124 帧、768×768、带音频的视频，端到端约 **5.6 分钟**（337–346 s）；同一台机器上官方 PyTorch 参考实现需要约 **22.6 分钟**。
++> 一句话：这个镜像里是为 **4 张海光 K100-AI** 调到极致的 MiniMax-H3 原生推理（InfiniLM + InfiniCore + 九齿 NineToothed）。准备好模型后，一条命令就能从“首帧 + 文本”生成 124 帧、768×768、带音频的视频：计分的 `generation.pipeline_total` 约 **250 s**（端到端约 5.9 分钟，其中约 100 s 是不计分的加载与预热）；同一台机器上官方 PyTorch 参考实现的 pipeline_total 约 **1043 s**。
+ 
+ ## 1. 它能做什么
+ 
+@@ -12,7 +12,8 @@
+ |---|---:|---:|---:|---:|
+ | 官方 PyTorch 参考实现（`--legacy`） | 20.4 s | 1043 s | 1354 s | 1.0× |
+ | InfiniLM 原始 TP4 路径（仅修复死锁） | 13.0 s | 676 s | 954 s | 1.4× |
+-| **本镜像默认配置** | **约 5.0 s** | **约 295 s** | **约 340 s** | **约 4.0×** |
++| 9 月镜像（2026-09-29） | 约 5.0 s | 约 295 s | 约 340 s | 约 3.5× |
++| **本镜像默认配置（2026-10-12，r17）** | **4.93 s** | **250.4 s** | **352 s** | **约 4.2×** |
+ 
+ 输出规格（分辨率、帧数、帧率、AAC 32 kHz 双声道）与官方参考完全一致。数值精度见第 6 节。
+ 
+@@ -60,6 +61,8 @@ cd /root/h3-work/h3-extreme
+ 
+ `run_h3.sh` 只是把本镜像的全部优化开关设好，然后把参数原样交给官方入口 `InfiniLM/examples/minimax_h3.py`，所以官方 CLI 的所有参数（`--height/--width`、`--last-frame`、`ref2va` 子命令、`--legacy` 参考实现等）都能直接用；相对路径按你的当前目录解析。
+ 
++评测方直接调用官方入口 `InfiniLM/examples/minimax_h3.py`（不经过 `run_h3.sh`）。所有经过验证的开关都是代码默认值（`InfiniLM/python/infinilm/multimodal/_h3_defaults.py` 在 import 时 `setdefault`），所以只要设好 DTK 环境和 `LD_LIBRARY_PATH=$INFINI_ROOT/lib`，直接调用入口与 `run_h3.sh` 的结果完全相同（`/root/h3-work/runs/run_plain.sh` 就是这样模仿评测环境的）。
++
+ 结束时会打印统一的计时表：
+ 
+ ```
+@@ -86,13 +89,25 @@ cd /root/h3-work/h3-extreme
+ **Kernel：** DiT 注意力与 Qwen3-VL 视觉注意力用厂商 flash kernel（`at::scaled_dot_product_attention`，DiT 形状约 96 TFLOPS；九齿版本 70；Qwen3-VL 文本的因果 GQA 较短，走 PyTorch 通用实现）；门控残差与其后的 RMSNorm/AdaLN、q/k 归一化 + RoPE、SwiGLU 等逐元素运算都是九齿生成的融合 kernel，保持参考实现的逐步 BF16 舍入。
+ 
+ **显存与加载：**
+-- SP 下 DiT 每卡约 48 GB，无法和 Qwen3-VL 同时常驻，于是分阶段：先上 Qwen3-VL 编码条件，释放后再上 DiT；
++- Qwen3-VL（TP4）与 DiT（SP4）同时常驻：Qwen3-VL 的静态 KV cache 从 32k 降到 8k（`H3_QWEN_MAX_CACHE_LEN`），VAE 解码器平时放在锁页主机内存、去噪期间后台上卡、解码后释放；两份权重都在加载阶段上卡；
+ - 权重用多线程 `pread` 读成整块内存，再零拷贝切成张量（mmap + 4 卡并发 H2D 只有 0.3 GB/s）；
+ - Qwen3-VL 的读盘与设备初始化、引擎创建并行，后台预读（VAE 优先、DiT 随后）给它让路；后台只读不锁页，上卡前再原地锁页（`hipHostRegister`，锁页 H2D 28 GB/s）；
+ - 设备内存分配器对大块按 2 MB 对齐精确分配（原来按 2 的幂取整，每卡浪费约 10 GB）。
+ 
+ **其余：** VAE 解码按 tile 分给 4 张卡（与串行逐位一致，28 s → 12 s）；FP32 VAE 先上卡再转 BF16（20.7 s → 3.6 s）；首次前向的集合通信同步完成，避免 HIP 惰性加载与 RCCL 互相等待导致死锁。
+ 
++**2026-10 起的改动：**
++- **加载期预热**（`_h3_warmup.py`，`H3_WARMUP`）：加载阶段用 448×448 合成首帧跑一次 2 步的小生成（输出丢弃，不缓存任何与输入有关的数据），把惰性加载、首次前向、库初始化挪进不计分的加载阶段：条件编码 3.0 → 1.2 s，VAE 编码 1.45 → 0.6 s，音频解码 1.5 → 0.3 s。
++- **GEMM 走 InfiniCore 的 cuBLASLt 路径**（DTK 映射到 hipBLASLt，`INFINICORE_HYGON_GEMM=lt`）：每个形状显式选一次启发式算法，确定性（不用 atomics split-K），每步快约 3%。逐个枚举 hipBLASLt 的 72 个可用算法后确认启发式已在最快一档（仅 down 投影还有约 5%，折合每步 0.4%，且不逐位一致，未采用）；`INFINICORE_GEMM_LT_TABLE`/`INFINICORE_GEMM_LT_AUTOTUNE` 保留为诊断工具。
++- **首次前向启动锁**（InfiniCore `collective_sync`）：首次前向串行化各 rank 线程的 kernel 启动，规避 DTK 25.04.2 惰性加载与他线程并发启动的段错误；所有集合通信入口先释放锁（RCCL 惰性建连会阻塞）。
++- **DiT 的 RoPE 表在 InfiniCore 里算**：16 个频率幂用 InfiniCore `float_power`（设备 `powf`），逐 token 的 cos/sin 用九齿 `h3_rope_cache` kernel；与原 PyTorch 写法逐位一致。Qwen3-VL 与 DiT 的位置下标改在主机上用 numpy 生成，路径上不再有 torch 的设备计算。
++- **视频帧转 PIL 放到设备上**（`install_video_postprocess`，`H3_VIDEO_POSTPROCESS`）：同样的 FP32 乘 255、就近偶数舍入、转 uint8 在 GPU 上分块做，连续的 uint8 帧拷回主机后多线程建 PIL，像素逐位相同；计时外的 `pipeline.other` 4.8 → 1.0 s。
++- **VAE tile 合批**（`H3_VAE_TILE_BATCH=4`）：每个副本把同尺寸 tile 4 个一批解码（每个 tile 仍各自独立），解码 7.0 → 5.9 s；与逐个解码的差异在 FP16 舍入量级（rel. L2 6e-4）。
++- qk 归一化 + RoPE kernel 改为每程序 1 个 token、1 个 warp（0.442 → 0.391 ms，逐位一致）。
++- **批量 AdaLN**（`H3_ADALN_BATCH=1`）：原先每个 block 每步都要做一次列并行小 GEMM、一次同步 all-gather，再把调制向量按 token gather 成 [tokens, 6×hidden] 的大表（SP4 下每块约 370 MB）。现在前向开始时一次算完 50 个 block 的本卡投影、只做一次 all-gather；本卡 token 按共用同一调制行分段（astronaut 用例 rank 0 有 6 段、其余 1 段），融合的 RMSNorm/AdaLN、门控残差 + RMSNorm/AdaLN、门控残差 kernel 按段在步长为 0 的广播视图上执行。单步逐位一致，4.940 → 4.827 s/步。
++
++**这套硬件的上限（2026-10-12 实测）：** 每卡 HBM 拷贝约 840 GB/s；8192³ BF16 GEMM 在 350 W 功耗墙下持续 109–111 TFLOPS（全零数据 142 TFLOPS，说明是功耗受限，满载时钟 900–1000 MHz）；厂商 FA 约 96 TFLOPS，与每次调用的头数无关（7 头 95.6、14 头 96.4）。DiT 的 GEMM（105–114 TFLOPS）已贴着上限，FA 也是厂商 kernel 的上限；每个 block 约 96 ms 中纯 GEMM + FA 约 81 ms，其余是逐元素 kernel（约 5 ms）、等待 all-to-all（本机 DCU0 链路慢，约 6 ms）和空隙。
++
+ ## 5. 开关一览
+ 
+ 一般不需要改。所有变量都可以在命令前覆盖，例如 `H3_PARALLEL=tp ./run_h3.sh ...`。
+@@ -107,13 +122,20 @@ cd /root/h3-work/h3-extreme
+ | `INFINICORE_HYGON_MHA` | `aten` | 厂商 flash 注意力；`ninetoothed` 用九齿 FA |
+ | `INFINICORE_HYGON_LINEAR` | 未设置 | `lt`：线性层走 hipBLASLt（再快约 2%，见第 8 节的稳定性说明） |
+ | `H3_VAE_PARALLEL` | `1` | VAE 多卡 tile 解码 |
++| `H3_ADALN_BATCH` | `1` | 批量 AdaLN 投影 + 一次 all-gather + 分段调制；`0` 回到逐块路径（逐位相同） |
++| `H3_VAE_TILE_BATCH` | `4` | 每个副本一次解码的同尺寸 tile 数；`1` 逐个解码（与串行逐位一致） |
++| `H3_VIDEO_POSTPROCESS` | `1` | 视频帧转 PIL 在设备上做；`0` 用原始主机路径 |
++| `H3_WARMUP` | `1` | 加载期小生成预热；`0` 关闭 |
++| `H3_QWEN_MAX_CACHE_LEN` | `8192` | Qwen3-VL 静态 KV cache 长度（条件输入约 600–2000 token） |
++| `INFINICORE_HYGON_GEMM` | `lt` | BF16 GEMM 走 cuBLASLt/hipBLASLt（显式启发式算法） |
++| `INFINICORE_GEMM_LT_TABLE` / `INFINICORE_GEMM_LT_AUTOTUNE` | 未设置 | 诊断：按形状指定/计时 hipBLASLt 启发式候选（`tools/tune_gemm_lt.py`） |
+ | `H3_TEXT_ENCODER` | 自动 | `sequential`/`tp_all`：强制分阶段或常驻 |
+ | `H3_HOST_CACHE` | `auto` | 主机权重缓存；`0` 关闭（省内存，重载时重新读盘） |
+ | `H3_HOST_CACHE_PINNED` | `1` | 主机缓存锁页 |
+ | `INFINILM_FAST_LOAD` | `1` | 并行 `pread` 快速加载 |
+ | `INFINILM_SYNC_FIRST_FORWARD` | `1` | 首次前向同步集合通信（防死锁，勿关） |
+ 
+-数值相关的 `H3_POINTWISE_NUMERICS=exact_ref H3_ADALN_NUMERICS=exact_ref H3_FUSED_ADALN=1 H3_DETERMINISTIC_BLAS=1` 等是经过验证的组合，`run_h3.sh` 已设好。
++数值相关的 `H3_POINTWISE_NUMERICS=exact_ref H3_ADALN_NUMERICS=exact_ref H3_FUSED_ADALN=1 H3_DETERMINISTIC_BLAS=1` 等是经过验证的组合，已是代码默认值（`_h3_defaults.py`），`run_h3.sh` 设的值与之相同。
+ 
+ ## 6. 精度怎么判断
+ 
+@@ -127,7 +149,7 @@ cd /root/h3-work/h3-extreme
+ | 36 | 0.013 | 0.015 |
+ | 48 | 0.018 | 0.020 |
+ 
+-（视频分支输出的相对 L2 误差，越小越接近官方参考。）本镜像每一步都比 TP4 更接近官方实现，主要因为 DiT 注意力与官方用的是同一个 flash kernel。整段视频与官方参考的 SSIM 约 88–91%（4 卡 87.6%、2 卡 90.4%），规格 7 项全部一致。
++（视频分支输出的相对 L2 误差，越小越接近官方参考。）本镜像每一步都比 TP4 更接近官方实现，主要因为 DiT 注意力与官方用的是同一个 flash kernel。整段视频与官方参考的 SSIM 约 88–91%（4 卡 87.6%、2 卡 90.4%），规格 7 项全部一致。2026-10-12 用赛方脚本彩排（`minimax_h3_compare.py --tasks fl2va`，prompt “A dog falls asleep”，首帧 astronaut）：pipeline_total 251.3 s 对 legacy 1038.2 s（4.13×），平均 SSIM 80.67%；同一 DiT 轨迹下 VAE 合批 ×1/×4 的 SSIM 为 80.651%/80.668%，差异来自 DiT 轨迹的分叉而非 VAE。节点上可用 `/root/h3-work/runs/run_compare.sh TAG` 复跑（只设库路径，模仿评测环境）。
+ 
+ 自己验证：
+ 
+@@ -156,7 +178,10 @@ bash logs/k100/rebuild_native.sh --kernels   # 重新生成九齿 AOT kernel 并
+ ## 8. 已知问题与排障
+ 
+ - **首步前偶发段错误（`hipLaunchKernel`，地址 0x20）**：在 DTK 25.04.2 上观察到，当一个线程惰性加载 kernel 模块或注册锁页内存、另一个线程同时启动 kernel 时，运行时可能崩溃。本镜像已规避：厂商注意力在引擎创建前由主线程逐卡预热；后台预读只读不锁页；hipBLASLt 线性层（按形状惰性加载模块）默认关闭。如仍遇到，重跑即可；`INFINICORE_HYGON_MHA=ninetoothed` 可完全避开厂商 kernel（约慢 15%）。
+-- **偶发的输出不一致**：少数运行的视频与其他次不同（两者均为正常视频，SSIM 约 97%），原因未定位；单步推理本身可逐位复现。
++- **偶发的输出不一致**：少数运行的视频与其他次不同（两者均为正常视频，SSIM 约 97%），原因未定位；单步推理本身可逐位复现，2026-10-12 连续 3 次带追踪的整跑与此前一次整跑逐字节相同。复现时用 `TRACE=1 /root/h3-work/runs/run_plain.sh TAG`（`tools/trace_pipeline.py` 记录每次组件调用输入输出的哈希），再用 `tools/compare_traces.py` 找第一次出现差异的调用。
++- **VAE 解码卡死（已修复）**：PyTorch 的 MIOpen 句柄按（线程，设备）缓存，创建时会惰性加载 HIP 代码对象；原先 tile 线程池随机分配设备，解码中途可能在新的（线程，设备）组合上创建句柄，与其他线程的 kernel 启动并发时在 `hsa_executable_freeze` 里永久等待。现在每个副本固定一个线程，句柄在安装时逐卡创建。
++- **rank 线程里不要用 `Tensor::to(CPU)` / 跨设备 `copy_from`**：它们会调用 `context::setDevice` 并新建 CPU 张量，改变该线程的 InfiniCore 上下文（以及后续算子所用的流）。2026-10-13 批量 AdaLN 第一版在前向里用 `to(CPU)` 读调制下标，通信稍慢时单步就变成约 7 s 且结果不可复现（`H3_ADALN_BATCH=0` 则正常）；改为 `infinirtStreamSynchronize` + `infinirtMemcpy` 后恢复逐位一致。
++- **py-spy**：阻塞式采样（默认）会在进程退出时把它停在 ptrace 信号投递点、无法退出；`run_plain.sh` 已改用 `--nonblocking`（开销也小得多）。
+ - **首次前向卡死**：若关闭了 `INFINILM_SYNC_FIRST_FORWARD`，4 卡首次前向可能因 HIP 惰性加载与 RCCL 互等而挂起。不要设置 `HIP_ENABLE_DEFERRED_LOADING=0`（系统 torch 的 fatbin 含无法解析的 FP8 符号，进程会直接失败）。
+ - **加载很慢**：检查模型是否在本地盘；`[h3.residency]` 日志会打印各阶段读取与上卡耗时。
+ - **显存不足**：分辨率/帧数更大时 SP 显存会更紧，可改 `H3_PARALLEL=tp`（每卡权重更少）。
+@@ -177,7 +202,7 @@ bash logs/k100/rebuild_native.sh --kernels   # 重新生成九齿 AOT kernel 并
+ ├── .venv/ .infini/           已构建好的 Python 环境与原生库
+ ```
+ 
+-常用诊断：`logs/k100/bench_step.sh <tag>`（单步 DiT 基准，可 `--compare` 逐位比较）、`logs/k100/profile_step.sh <tag>`（hipprof kernel 统计）、`tools/prof_timeline.py`（通信是否被计算覆盖）。
++常用诊断：`logs/k100/bench_step.sh <tag>`（单步 DiT 基准，可 `--compare` 逐位比较）、`logs/k100/profile_step.sh <tag>`（hipprof kernel 统计）、`tools/prof_timeline.py`（通信是否被计算覆盖）、`tools/pyspy_pipeline_other.py`（py-spy 采样里计时组件之外的时间归属）、`tools/trace_pipeline.py` + `tools/compare_traces.py`（两次整跑逐调用比较）、`tools/probe_rope_cache.py`、`tools/check_video_postprocess.py`、`tools/bench_vae_decode.py`（各项改动的逐位/误差验证）。
+ 
+ ## 10. 版本
+ 
+diff --git a/configs/gfx906/attention.json b/configs/gfx906/attention.json
+new file mode 100644
+index 0000000..1bee626
+--- /dev/null
++++ b/configs/gfx906/attention.json
+@@ -0,0 +1,8 @@
++{
++  "block_m": 128,
++  "block_n": 32,
++  "num_warps": 4,
++  "num_stages": 1,
++  "numerics": "fp32_qk",
++  "backend_options": {}
++}
+diff --git a/scripts/build_h3_attention.py b/scripts/build_h3_attention.py
+index 8266cdb..a7b5980 100644
+--- a/scripts/build_h3_attention.py
++++ b/scripts/build_h3_attention.py
+@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
+ sys.path[:0] = [str(ROOT / "ninetoothed/src"), str(ROOT / "tools")]
+ from h3_attention import make_attention
+ from h3_pointwise import (make_gated_residual, make_gated_residual_rms_modulate, make_qk_norm_rope,
+-                          make_rms, make_rms_modulate, make_rope, make_swiglu)
++                          make_rms, make_rms_modulate, make_rope, make_rope_cache, make_swiglu)
+ from ninetoothed.platform import current_target
+ 
+ parser = argparse.ArgumentParser()
+@@ -30,4 +30,5 @@ make_rope(caller="hip", output_dir=args.output, archs=archs)
+ make_gated_residual(caller="hip", output_dir=args.output, archs=archs)
+ make_gated_residual_rms_modulate(caller="hip", output_dir=args.output, archs=archs)
+ make_qk_norm_rope(caller="hip", output_dir=args.output, archs=archs)
++make_rope_cache(caller="hip", output_dir=args.output, archs=archs)
+ print(json.dumps({"event": "built", "archs": archs, "output": str(args.output), "config": config}))
+diff --git a/scripts/z100/bootstrap_z100.sh b/scripts/z100/bootstrap_z100.sh
+new file mode 100755
+index 0000000..4bd44f2
+--- /dev/null
++++ b/scripts/z100/bootstrap_z100.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++# One-time preparation of a fresh Z100 pod, in the order the obstacles appear.
++# Run it inside the pod:  bash "$WORK_HOME/h3/scripts/z100/bootstrap_z100.sh"
++#
++# Why each step is here (all measured on the contest pod, 2026-10-13):
++#   * the image has no xmake, pybind11 or triton, and no /opt/rocm;
++#   * GitHub is unreliable from this network (HTTP/2 framing errors, TLS
++#     resets, timeouts), so xmake's package repositories are unreachable and
++#     the sources are uploaded over ssh instead of cloned;
++#   * pybind11 3.x crashes this tree during pybind registration, so the build
++#     needs 2.x -- and the whole C++ API must be compiled against the same
++#     one, since both use the identical include path;
++#   * upstream Triton has no gfx906 backend, so NineToothed kernels cannot be
++#     generated here; the build therefore omits --h3-ninetoothed.
++set -euo pipefail
++: "${WORK_HOME:?enter the pod with WORK_HOME set, as the contest guide shows}"
++HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++source "$HERE/setup_env_z100.sh"
++export PATH=/root/.local/bin:$PATH
++
++if ! command -v xmake >/dev/null 2>&1; then
++  echo "== installing xmake 3.0.5"
++  curl -fsSL -o /tmp/xmake.run \
++    https://github.com/xmake-io/xmake/releases/download/v3.0.5/xmake-v3.0.5.gz.run
++  sh /tmp/xmake.run
++fi
++# Without this xmake blocks trying to clone its package repositories.
++xmake global --network=private
++
++echo "== python build dependencies"
++python -m pip install -q "pybind11<3"
++python -c "import pybind11; print('pybind11', pybind11.__version__)"
++
++echo "== environment"
++python - <<'PY'
++import torch
++print("torch", torch.__version__, "hip", torch.version.hip)
++print("devices", torch.cuda.device_count(),
++      torch.cuda.get_device_name(0), torch.cuda.get_device_properties(0).gcnArchName)
++PY
++echo "BOOTSTRAP_Z100_OK  (next: scripts/z100/build_z100.sh core)"
+diff --git a/scripts/z100/build_z100.sh b/scripts/z100/build_z100.sh
+new file mode 100755
+index 0000000..52bce6d
+--- /dev/null
++++ b/scripts/z100/build_z100.sh
+@@ -0,0 +1,48 @@
++#!/usr/bin/env bash
++# Build InfiniCore (and optionally InfiniLM) for the Z100 pod, generate this
++# tree's NineToothed AOT kernels for its architecture, and run the operator
++# tests. Usage, inside the pod:
++#   bash "$WORK_HOME/h3/scripts/z100/build_z100.sh" [core|kernels|lm|all]
++set -euo pipefail
++WHAT=${1:-all}
++source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/setup_env_z100.sh"
++git config --global --add safe.directory "$INFINICORE_DIR" || true
++git config --global --add safe.directory "$INFINILM_DIR" || true
++
++if [ "$WHAT" = core ] || [ "$WHAT" = all ]; then
++  cd "$INFINICORE_DIR"
++  # Offline build: this network cannot reach xmake's package repositories, so
++  # pybind11 comes from the installed wheel (2.x -- see bootstrap_z100.sh).
++  export H3_OFFLINE_BUILD=1
++  export H3_PYBIND11_INCLUDE=$(python -c 'import pybind11; print(pybind11.get_include())')
++  export H3_PYTHON_INCLUDE=$(python -c 'import sysconfig; print(sysconfig.get_path("include"))')
++  xmake f -y -cv --hygon-dcu=y --hygon-arch="$HYGON_ARCH" \
++      --cuda=/opt/dtk/cuda/cuda --ccl=y --aten=y --omp=n
++  xmake build -j 16
++  xmake install
++  xmake build -j 16 _infinicore
++  xmake install _infinicore
++  python -m pip install -e . --no-deps --no-build-isolation
++  python -c "import torch; import infinicore; print('infinicore', infinicore.__file__)"
++  python test/infinicore/ops/timestep_embedding.py --hygon || true
++fi
++
++if [ "$WHAT" = kernels ]; then
++  # The H3 NineToothed kernels of this tree, AOT for the pod's architecture.
++  # Not part of "all" on gfx906: upstream Triton has no backend for it
++  # ("error: unsupported target: 'gfx906'"), so this needs a Hygon DAS triton.
++  # tools/probe_triton_arch.py qualifies a candidate before trying this.
++  cd "$H3_TREE"
++  python scripts/build_h3_attention.py --archs "$HYGON_ARCH" \
++      --output "$INFINICORE_DIR/build/h3_ninetoothed"
++fi
++
++if [ "$WHAT" = lm ] || [ "$WHAT" = all ]; then
++  cd "$INFINILM_DIR"
++  xmake build -j 16 infinicore_infer
++  xmake install infinicore_infer
++  xmake build -j 16 _infinilm
++  xmake install _infinilm
++  python -m pip install -e . --no-deps --no-build-isolation
++fi
++echo "BUILD_Z100_OK $WHAT"
+diff --git a/scripts/z100/run_ops_z100.sh b/scripts/z100/run_ops_z100.sh
+new file mode 100755
+index 0000000..80fe8b5
+--- /dev/null
++++ b/scripts/z100/run_ops_z100.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++# Operator correctness + performance table on the Z100 pod (BF16 and FP16),
++# plus the attention tiling sweep. Results land in $WORK_HOME/h3-z100/.
++set -euo pipefail
++source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/setup_env_z100.sh"
++OUT=${OUT:-$WORK_HOME/h3-z100}
++SEQ=${SEQ:-8192}
++HEADS=${HEADS:-14}
++mkdir -p "$OUT"
++cd "$H3_TREE"
++for dtype in bf16 fp16; do
++  echo "== operators, $dtype"
++  python tools/bench_h3_ops.py --seq "$SEQ" --heads "$HEADS" --dtype "$dtype" \
++      --json "$OUT/ops_$dtype.json" 2>&1 | tee "$OUT/ops_$dtype.log"
++done
++echo "== attention tiling sweep"
++python tools/tune_attention.py --seq "$SEQ" --heads "$HEADS" \
++    --output "$OUT/attention_tune.json" 2>&1 | tee "$OUT/attention_tune.log"
++echo OPS_Z100_DONE
+diff --git a/scripts/z100/setup_env_z100.sh b/scripts/z100/setup_env_z100.sh
+new file mode 100755
+index 0000000..699ade0
+--- /dev/null
++++ b/scripts/z100/setup_env_z100.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++# Environment for the contest's Hygon Z100 pod, as the organizers' guide
++# prescribes (DTK, xmake, rocm_smi library paths). Source it in every pod
++# shell:  source "$WORK_HOME/h3/scripts/z100/setup_env_z100.sh"
++source /opt/dtk/env.sh
++
++export XMAKE_ROOT=y
++export WORK_HOME="${WORK_HOME:?enter the pod with WORK_HOME set (see the guide)}"
++export INFINI_ROOT=${INFINI_ROOT:-/root/.infini}
++export PATH="/root/.local/bin:/opt/dtk/cuda/cuda/bin:${PATH}"
++# librocm_smi64.so.2 lives in the .hyhal paths; without them importing torch fails.
++export LD_LIBRARY_PATH="${INFINI_ROOT}/lib:/opt/dtk/lib:/opt/dtk/cuda/cuda/lib64:/usr/local/lib/python3.11/site-packages/torch/lib:/opt/hyhal/lib:/opt/dtk/.hyhal/rocm_smi/lib:/opt/dtk/.hyhal/rocm_smi:${LD_LIBRARY_PATH:-}"
++
++# This tree (the K100 work) and the organizers' clones.
++export H3_TREE=${H3_TREE:-$WORK_HOME/h3}
++# This tree's InfiniCore (uploaded with ops/zpush_core.sh); the organizers'
++# clone lives in $WORK_HOME/Projects/InfiniCore if you prefer that one.
++export INFINICORE_DIR=${INFINICORE_DIR:-$H3_TREE/InfiniCore}
++export INFINILM_DIR=${INFINILM_DIR:-$WORK_HOME/Projects/InfiniLM}
++export PYTHONPATH="$H3_TREE/ninetoothed/src:$H3_TREE/tools:${PYTHONPATH:-}"
++export HYGON_ARCH=${HYGON_ARCH:-gfx906}
+diff --git a/tools/bench_h3_ops.py b/tools/bench_h3_ops.py
+new file mode 100644
+index 0000000..8a28291
+--- /dev/null
++++ b/tools/bench_h3_ops.py
+@@ -0,0 +1,350 @@
++#!/usr/bin/env python3
++"""Operator-level correctness and performance harness for the MiniMax-H3
++NineToothed kernels of this tree (attention, q/k norm + RoPE, RoPE, the RoPE
++table, RMSNorm, RMSNorm/AdaLN, gated residual, gated residual + RMSNorm/AdaLN,
++SwiGLU).
++
++For every operator it builds the kernel with NineToothed, runs the eager
++PyTorch composition that the reference pipeline performs as the baseline, and
++reports whether the kernel output is bitwise identical to it (plus the largest
++absolute difference when it is not) and how long each takes. The reference
++composition keeps the per-step BF16 rounding of the Diffusers implementation,
++which is what these kernels reproduce.
++
++It needs only PyTorch and NineToothed (no InfiniCore build), so the same
++command runs on any Hygon architecture:
++
++    python tools/bench_h3_ops.py --seq 8192 --heads 14 --json ops_z100.json
++
++Options worth knowing:
++    --dtype bf16|fp16   kernel and tensor dtype (gfx906/Z100 has no native
++                        BF16 arithmetic, so fp16 is the fallback to compare)
++    --ops a,b,c         run only these operators
++    --repeats N         timed iterations (after 3 warmup iterations)
++Never used by generation; diagnostics only.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++sys.path[:0] = [str(Path(__file__).resolve().parents[1] / "ninetoothed/src"),
++                str(Path(__file__).resolve().parent)]
++
++import ninetoothed  # noqa: E402
++
++from h3_attention import make_attention  # noqa: E402
++from h3_pointwise import (  # noqa: E402
++    make_gated_residual,
++    make_gated_residual_rms_modulate,
++    make_qk_norm_rope,
++    make_rms,
++    make_rms_modulate,
++    make_rope,
++    make_rope_cache,
++    make_swiglu,
++)
++
++DTYPES = {"bf16": (torch.bfloat16, ninetoothed.bfloat16),
++          "fp16": (torch.float16, ninetoothed.float16)}
++HIDDEN = 5376
++FFN = 14336
++HEAD_DIM = 128
++
++
++def timed(fn, repeats: int) -> float:
++    """Milliseconds per call, after three warmup calls."""
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize()
++    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    start.record()
++    for _ in range(repeats):
++        fn()
++    end.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(end) / repeats
++
++
++def difference(out: torch.Tensor, reference: torch.Tensor) -> tuple[bool, float]:
++    same = torch.equal(out, reference)
++    if same:
++        return True, 0.0
++    return False, (out.float() - reference.float()).abs().max().item()
++
++
++def rms_norm_reference(x, weight, eps):
++    """RMSNorm with each intermediate rounded to the tensor dtype, as the
++    Diffusers reference does in BF16."""
++    squared = (x.float() * x.float()).to(x.dtype)
++    mean = (squared.float().sum(-1, keepdim=True) / x.shape[-1]).to(x.dtype)
++    variance = (mean.float() + torch.tensor(eps, dtype=torch.float32, device=x.device)).to(x.dtype)
++    reciprocal = torch.rsqrt(variance.float()).to(x.dtype)
++    return ((x.float() * reciprocal.float()).to(x.dtype).float() * weight.float()).to(x.dtype)
++
++
++def modulate_reference(normalized, scale, shift):
++    factor = (scale.float() + 1.0).to(scale.dtype)
++    return ((normalized.float() * factor.float()).to(normalized.dtype).float() + shift.float()).to(normalized.dtype)
++
++
++def rope_reference(x, cos, sin):
++    """3-axis NeoX RoPE on the first 96 of 128 channels, BF16 rounding per step."""
++    a, b, passthrough = x[..., :48], x[..., 48:96], x[..., 96:]
++    c = cos.float().unsqueeze(-2)
++    s = sin.float().unsqueeze(-2)
++    ac = (a.float() * c).to(x.dtype)
++    bs = (-b.float() * s).to(x.dtype)
++    bc = (b.float() * c).to(x.dtype)
++    a_s = (a.float() * s).to(x.dtype)
++    return torch.cat([(ac.float() + bs.float()).to(x.dtype),
++                      (bc.float() + a_s.float()).to(x.dtype), passthrough], dim=-1)
++
++
++def rotary_cache_reference(position_ids, rope_freq_dim=16, rope_theta=10000.0, dtype=torch.bfloat16):
++    inverse = 1.0 / (rope_theta ** (torch.arange(0, 2 * rope_freq_dim, 2, dtype=torch.float32,
++                                                 device=position_ids.device) / (2 * rope_freq_dim)))
++    frequencies = (position_ids.float().unsqueeze(-1) * inverse.view(1, 1, -1)).flatten(1)
++    return torch.cat((frequencies.cos(), frequencies.sin()), dim=-1).to(dtype)
++
++
++def op_attention(cfg):
++    heads, seq, dtype = cfg.heads, cfg.seq, cfg.torch_dtype
++    scale = HEAD_DIM ** -0.5
++    q, k, v = (torch.randn(1, heads, seq, HEAD_DIM, device=cfg.device, dtype=dtype) for _ in range(3))
++    kernel = make_attention(dtype=cfg.nt_dtype, **cfg.attention_config)
++    out = torch.empty_like(q)
++    baseline = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=scale)  # noqa: E731
++    reference = baseline()
++    kernel(q, k, v, scale, out)
++    flops = 4 * seq * seq * HEAD_DIM * heads
++    return out, reference, lambda: kernel(q, k, v, scale, out), baseline, flops
++
++
++def op_qk_norm_rope(cfg):
++    """Per-head RMSNorm + 3-axis RoPE written into a packed send buffer, on a
++    strided view of a fused QKV projection (the sequence-parallel layout)."""
++    tokens, dtype = cfg.seq, cfg.torch_dtype
++    ranks, heads = 1, cfg.heads
++    projected = torch.randn(tokens, 3, ranks * heads, HEAD_DIM, device=cfg.device, dtype=dtype)
++    source = projected[:, 0]
++    x = source.as_strided((tokens, ranks, heads, HEAD_DIM),
++                          (source.stride(0), heads * source.stride(1), source.stride(1), 1))
++    weight = (torch.rand(HEAD_DIM, device=cfg.device) + 0.5).to(dtype)
++    cos = torch.rand(tokens, 48, device=cfg.device).to(dtype)
++    sin = torch.rand(tokens, 48, device=cfg.device).to(dtype)
++    send = torch.empty(ranks, tokens, heads, HEAD_DIM, device=cfg.device, dtype=dtype)
++    out = send.permute(1, 0, 2, 3)
++    kernel = make_qk_norm_rope(dtype=cfg.nt_dtype)
++
++    def baseline():
++        normalized = rms_norm_reference(x, weight, 1e-6)
++        rotated = rope_reference(normalized, cos.unsqueeze(1).expand(-1, ranks, -1),
++                                 sin.unsqueeze(1).expand(-1, ranks, -1))
++        return rotated.permute(1, 0, 2, 3).contiguous()
++
++    reference = baseline()
++    kernel(x, weight, 1e-6, cos, sin, out)
++    return send, reference, lambda: kernel(x, weight, 1e-6, cos, sin, out), baseline, None
++
++
++def op_rope(cfg):
++    tokens, dtype = cfg.seq, cfg.torch_dtype
++    x = torch.randn(1, tokens, HEAD_DIM, device=cfg.device, dtype=dtype)
++    cos = torch.rand(tokens, 48, device=cfg.device).to(dtype)
++    sin = torch.rand(tokens, 48, device=cfg.device).to(dtype)
++    kernel = make_rope(dtype=cfg.nt_dtype)
++    out = torch.empty_like(x)
++    baseline = lambda: rope_reference(x, cos.unsqueeze(0), sin.unsqueeze(0))  # noqa: E731
++    reference = baseline()
++    kernel(x, cos, sin, out)
++    return out, reference, lambda: kernel(x, cos, sin, out), baseline, None
++
++
++def op_rope_cache(cfg):
++    tokens = cfg.seq
++    positions = torch.randint(0, 4096, (tokens, 3), device=cfg.device).double()
++    exponent = torch.tensor([2 * k / 32 for k in range(16)], dtype=torch.float32, device=cfg.device)
++    power = torch.full_like(exponent, 10000.0) ** exponent
++    kernel = make_rope_cache(dtype=cfg.nt_dtype)
++    out = torch.empty(tokens, 96, device=cfg.device, dtype=cfg.torch_dtype)
++    baseline = lambda: rotary_cache_reference(positions, dtype=cfg.torch_dtype)  # noqa: E731
++    reference = baseline()
++    kernel(positions, power, out[:, :48], out[:, 48:])
++    return out, reference, lambda: kernel(positions, power, out[:, :48], out[:, 48:]), baseline, None
++
++
++def op_rms(cfg):
++    tokens, dtype = cfg.seq, cfg.torch_dtype
++    x = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 8
++    weight = torch.randn(HIDDEN, device=cfg.device, dtype=dtype)
++    kernel = make_rms(width=HIDDEN, dtype=cfg.nt_dtype)
++    out = torch.empty_like(x)
++    baseline = lambda: rms_norm_reference(x, weight, 1e-6)  # noqa: E731
++    reference = baseline()
++    kernel(x, weight, 1e-6, out)
++    return out, reference, lambda: kernel(x, weight, 1e-6, out), baseline, None
++
++
++def op_rms_modulate(cfg):
++    tokens, dtype = cfg.seq, cfg.torch_dtype
++    x = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 8
++    weight = torch.randn(HIDDEN, device=cfg.device, dtype=dtype)
++    scale = (torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 0.5)
++    shift = (torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 0.5)
++    kernel = make_rms_modulate(dtype=cfg.nt_dtype)
++    out = torch.empty_like(x)
++    baseline = lambda: modulate_reference(rms_norm_reference(x, weight, 1e-6), scale, shift)  # noqa: E731
++    reference = baseline()
++    kernel(x, weight, 1e-6, scale, shift, out)
++    return out, reference, lambda: kernel(x, weight, 1e-6, scale, shift, out), baseline, None
++
++
++def op_gated_residual(cfg):
++    tokens, dtype = cfg.seq, cfg.torch_dtype
++    x = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 8
++    y = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype)
++    gate = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 0.5
++    kernel = make_gated_residual(dtype=cfg.nt_dtype)
++    out = torch.empty_like(x)
++    baseline = lambda: torch.add(x, torch.mul(gate, y))  # noqa: E731
++    reference = baseline()
++    kernel(x, gate, y, out)
++    return out, reference, lambda: kernel(x, gate, y, out), baseline, None
++
++
++def op_gated_residual_rms_modulate(cfg):
++    tokens, dtype = cfg.seq, cfg.torch_dtype
++    x = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 8
++    y = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype)
++    gate = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 0.5
++    weight = torch.randn(HIDDEN, device=cfg.device, dtype=dtype)
++    scale = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 0.5
++    shift = torch.randn(1, tokens, HIDDEN, device=cfg.device, dtype=dtype) * 0.5
++    kernel = make_gated_residual_rms_modulate(dtype=cfg.nt_dtype)
++    residual, out = torch.empty_like(x), torch.empty_like(x)
++
++    def baseline():
++        added = torch.add(x, torch.mul(gate, y))
++        return added, modulate_reference(rms_norm_reference(added, weight, 1e-6), scale, shift)
++
++    reference_residual, reference_out = baseline()
++    kernel(x, gate, y, weight, 1e-6, scale, shift, residual, out)
++    same_residual, delta_residual = difference(residual, reference_residual)
++    if not same_residual:
++        print(f"  (residual differs, max |diff| {delta_residual:.3g})")
++    return out, reference_out, lambda: kernel(x, gate, y, weight, 1e-6, scale, shift, residual, out), baseline, None
++
++
++def op_swiglu(cfg):
++    tokens, dtype = cfg.seq, cfg.torch_dtype
++    packed = torch.randn(1, tokens, 2 * FFN, device=cfg.device, dtype=dtype) * 2
++    up, gate = packed[..., :FFN], packed[..., FFN:]
++    kernel = make_swiglu(dtype=cfg.nt_dtype)
++    out = torch.empty(1, tokens, FFN, device=cfg.device, dtype=dtype)
++
++    def baseline():
++        value = gate.float()
++        activated = (value / (1.0 + torch.exp(-value))).to(dtype)
++        return up * activated
++
++    reference = baseline()
++    kernel(up, gate, out)
++    return out, reference, lambda: kernel(up, gate, out), baseline, None
++
++
++OPERATORS = {
++    "attention": op_attention,
++    "qk_norm_rope": op_qk_norm_rope,
++    "rope": op_rope,
++    "rope_cache": op_rope_cache,
++    "rms": op_rms,
++    "rms_modulate": op_rms_modulate,
++    "gated_residual": op_gated_residual,
++    "gated_residual_rms_modulate": op_gated_residual_rms_modulate,
++    "swiglu": op_swiglu,
++}
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__,
++                                     formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--seq", type=int, default=8192, help="tokens (default 8192)")
++    parser.add_argument("--heads", type=int, default=14, help="attention heads per device")
++    parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--repeats", type=int, default=20)
++    parser.add_argument("--ops", help="comma-separated subset of " + ",".join(OPERATORS))
++    parser.add_argument("--attention-config", default="{}",
++                        help='JSON overrides, e.g. {"block_m": 128, "block_n": 32, "num_warps": 4}')
++    parser.add_argument("--json", type=Path, help="write the results as JSON")
++    parser.add_argument("--seed", type=int, default=0)
++    args = parser.parse_args()
++
++    if not torch.cuda.is_available():
++        print("no accelerator visible")
++        return 1
++    torch.manual_seed(args.seed)
++    torch_dtype, nt_dtype = DTYPES[args.dtype]
++    attention_config = {"block_m": 128, "block_n": 32, "num_warps": 4, "num_stages": 1}
++    attention_config.update(json.loads(args.attention_config))
++
++    class Config:
++        seq = args.seq
++        heads = args.heads
++        device = args.device
++        torch_dtype = None
++        nt_dtype = None
++        attention_config = None
++
++    cfg = Config()
++    cfg.torch_dtype = torch_dtype
++    cfg.nt_dtype = nt_dtype
++    cfg.attention_config = attention_config
++
++    properties = torch.cuda.get_device_properties(torch.device(args.device))
++    environment = {"device": properties.name, "arch": properties.gcnArchName,
++                   "torch": torch.__version__, "hip": getattr(torch.version, "hip", None),
++                   "dtype": args.dtype, "seq": args.seq, "heads": args.heads,
++                   "attention_config": attention_config}
++    print(json.dumps(environment), flush=True)
++    print(f"{'operator':<30} {'kernel':>10} {'eager':>10} {'speedup':>8} {'bitwise':>8}  note", flush=True)
++
++    selected = args.ops.split(",") if args.ops else list(OPERATORS)
++    results = []
++    for name in selected:
++        if name not in OPERATORS:
++            print(f"{name:<30} unknown operator")
++            continue
++        try:
++            with torch.cuda.device(args.device), torch.inference_mode():
++                out, reference, run, baseline, flops = OPERATORS[name](cfg)
++                same, delta = difference(out, reference)
++                kernel_ms = timed(run, args.repeats)
++                eager_ms = timed(baseline, args.repeats)
++        except Exception as exc:  # noqa: BLE001
++            print(f"{name:<30} failed: {type(exc).__name__}: {str(exc)[:90]}", flush=True)
++            results.append({"operator": name, "error": f"{type(exc).__name__}: {exc}"})
++            continue
++        note = "" if same else f"max |diff| {delta:.3g}"
++        if flops:
++            note = (note + " " if note else "") + f"{flops / kernel_ms / 1e9:.1f} TFLOPS"
++        print(f"{name:<30} {kernel_ms:9.3f}m {eager_ms:9.3f}m {eager_ms / kernel_ms:7.2f}x "
++              f"{str(same):>8}  {note}", flush=True)
++        results.append({"operator": name, "kernel_ms": kernel_ms, "eager_ms": eager_ms,
++                        "speedup": eager_ms / kernel_ms, "bitwise_equal": same,
++                        "max_abs_difference": delta, "flops": flops})
++    if args.json:
++        args.json.write_text(json.dumps({"environment": environment, "results": results,
++                                         "diagnostic_only": True}, indent=2) + "\n")
++        print(f"wrote {args.json}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/bench_infinicore_ops.py b/tools/bench_infinicore_ops.py
+new file mode 100644
+index 0000000..5c615c5
+--- /dev/null
++++ b/tools/bench_infinicore_ops.py
+@@ -0,0 +1,227 @@
++#!/usr/bin/env python3
++"""Baseline measurement of the MiniMax-H3 operators as InfiniCore implements
++them, against the PyTorch composition the reference pipeline performs.
++
++Unlike tools/bench_h3_ops.py (which measures this tree's NineToothed kernels
++and therefore needs a Triton backend for the architecture), this harness only
++needs a built InfiniCore with its Python extension, so it runs on any
++architecture InfiniCore supports -- including gfx906/Z100, where upstream
++Triton has no backend.
++
++For every operator it reports whether InfiniCore's result matches the PyTorch
++reference (bitwise, and the largest absolute difference otherwise) and the
++time of each, at the H3 shapes. Use it to establish the baseline an
++optimization is measured against, and to re-measure afterwards.
++
++    python tools/bench_infinicore_ops.py --tokens 8192 --json base.json
++
++Diagnostics only; never used by generation.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import torch
++
++import infinicore
++from infinicore.lib import _infinicore
++
++HIDDEN = 5376
++FFN = 14336
++HEAD_DIM = 128
++TIME_EMBED_DIM = 256
++
++
++def wrap(tensor: torch.Tensor):
++    """An InfiniCore view of a torch tensor's storage (no copy)."""
++    return infinicore.strided_from_blob(
++        tensor.data_ptr(), list(tensor.shape), list(tensor.stride()),
++        dtype=infinicore.utils.to_infinicore_dtype(tensor.dtype),
++        device=infinicore.device(tensor.device.type, tensor.device.index or 0),
++    )._underlying
++
++
++def timed(fn, repeats: int, device) -> float:
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize(device)
++    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    start.record()
++    for _ in range(repeats):
++        fn()
++    end.record()
++    torch.cuda.synchronize(device)
++    return start.elapsed_time(end) / repeats
++
++
++def difference(out: torch.Tensor, reference: torch.Tensor):
++    if torch.equal(out, reference):
++        return True, 0.0
++    return False, (out.float() - reference.float()).abs().max().item()
++
++
++def op_rms_norm(cfg):
++    x = torch.randn(1, cfg.tokens, HIDDEN, device=cfg.device, dtype=cfg.dtype) * 8
++    weight = torch.randn(HIDDEN, device=cfg.device, dtype=cfg.dtype)
++    out = torch.empty_like(x)
++    native = lambda: _infinicore.rms_norm_(wrap(out), wrap(x), wrap(weight), 1e-6)  # noqa: E731
++    reference = lambda: torch.nn.functional.rms_norm(x, (HIDDEN,), weight, eps=1e-6)  # noqa: E731
++    native()
++    return out, reference(), native, reference, None
++
++
++def op_swiglu(cfg):
++    packed = torch.randn(1, cfg.tokens, 2 * FFN, device=cfg.device, dtype=cfg.dtype) * 2
++    up, gate = packed[..., :FFN].contiguous(), packed[..., FFN:].contiguous()
++    out = torch.empty(1, cfg.tokens, FFN, device=cfg.device, dtype=cfg.dtype)
++    native = lambda: _infinicore.swiglu_(wrap(out), wrap(up), wrap(gate))  # noqa: E731
++    reference = lambda: up * torch.nn.functional.silu(gate)  # noqa: E731
++    native()
++    return out, reference(), native, reference, None
++
++
++def op_gemm(cfg):
++    """The DiT's widest projection shape (gate_up), as InfiniCore's linear."""
++    m, n, k = cfg.tokens, 2 * FFN // cfg.shard, HIDDEN
++    a = torch.randn(m, k, device=cfg.device, dtype=cfg.dtype) * 0.05
++    b = torch.randn(n, k, device=cfg.device, dtype=cfg.dtype) * 0.05
++    out = torch.empty(m, n, device=cfg.device, dtype=cfg.dtype)
++    native = lambda: _infinicore.matmul_(wrap(out), wrap(a), wrap(b.t()))  # noqa: E731
++    reference = lambda: a @ b.t()  # noqa: E731
++    native()
++    return out, reference(), native, reference, 2 * m * n * k
++
++
++def op_attention(cfg):
++    heads = cfg.heads
++    q, k, v = (torch.randn(1, cfg.tokens, heads, HEAD_DIM, device=cfg.device, dtype=cfg.dtype)
++               for _ in range(3))
++    out = torch.empty_like(q)
++    scale = HEAD_DIM ** -0.5
++
++    def native():
++        _infinicore.mha_(wrap(out), wrap(q), wrap(k), wrap(v), None, scale, False)
++
++    def reference():
++        return torch.nn.functional.scaled_dot_product_attention(
++            q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3),
++            scale=scale).permute(0, 2, 1, 3).contiguous()
++
++    native()
++    return out, reference(), native, reference, 4 * cfg.tokens * cfg.tokens * HEAD_DIM * heads
++
++
++def op_timestep_embedding(cfg):
++    timestep = torch.rand(2, device=cfg.device, dtype=torch.float32) * 1000
++    out = torch.empty(2, TIME_EMBED_DIM, device=cfg.device, dtype=torch.float32)
++    native = lambda: _infinicore.timestep_embedding_(wrap(out), wrap(timestep))  # noqa: E731
++
++    def reference():
++        half = TIME_EMBED_DIM // 2
++        frequencies = torch.exp(
++            -torch.log(torch.tensor(10000.0, device=cfg.device))
++            * torch.arange(half, device=cfg.device, dtype=torch.float32) / half)
++        angles = timestep[:, None] * frequencies[None, :]
++        return torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
++
++    native()
++    return out, reference(), native, reference, None
++
++
++def op_embedding(cfg):
++    """Row gather, as the AdaLN modulation and the RoPE table use it."""
++    table = torch.randn(3 * 2, 6 * HIDDEN, device=cfg.device, dtype=cfg.dtype)
++    indices = torch.randint(0, table.shape[0], (cfg.tokens,), device=cfg.device)
++    out = torch.empty(cfg.tokens, table.shape[1], device=cfg.device, dtype=cfg.dtype)
++    native = lambda: _infinicore.embedding_(wrap(out), wrap(indices), wrap(table))  # noqa: E731
++    reference = lambda: table[indices]  # noqa: E731
++    native()
++    return out, reference(), native, reference, None
++
++
++OPERATORS = {
++    "rms_norm": op_rms_norm,
++    "swiglu": op_swiglu,
++    "gemm_gate_up": op_gemm,
++    "attention": op_attention,
++    "timestep_embedding": op_timestep_embedding,
++    "embedding": op_embedding,
++}
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__,
++                                     formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--tokens", type=int, default=8192)
++    parser.add_argument("--heads", type=int, default=14)
++    parser.add_argument("--shard", type=int, default=1,
++                        help="divide the GEMM's N by this (a tensor-parallel shard)")
++    parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--repeats", type=int, default=20)
++    parser.add_argument("--ops", help="comma-separated subset of " + ",".join(OPERATORS))
++    parser.add_argument("--json", type=Path)
++    parser.add_argument("--seed", type=int, default=0)
++    args = parser.parse_args()
++
++    if not torch.cuda.is_available():
++        print("no accelerator visible")
++        return 1
++    torch.manual_seed(args.seed)
++    dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
++
++    class Config:
++        tokens = args.tokens
++        heads = args.heads
++        shard = args.shard
++        device = args.device
++        dtype = dtypes[args.dtype]
++
++    cfg = Config()
++    device = torch.device(args.device)
++    torch.cuda.set_device(device)
++    infinicore.set_device(infinicore.device(device.type, device.index or 0))
++
++    properties = torch.cuda.get_device_properties(device)
++    environment = {"device": properties.name, "arch": properties.gcnArchName,
++                   "torch": torch.__version__, "hip": getattr(torch.version, "hip", None),
++                   "dtype": args.dtype, "tokens": args.tokens, "heads": args.heads,
++                   "shard": args.shard}
++    print(json.dumps(environment), flush=True)
++    print(f"{'operator':<22} {'infinicore':>11} {'torch':>10} {'ratio':>7} {'match':>7}  note",
++          flush=True)
++
++    results = []
++    for name in (args.ops.split(",") if args.ops else list(OPERATORS)):
++        if name not in OPERATORS:
++            print(f"{name:<22} unknown operator")
++            continue
++        try:
++            with torch.inference_mode():
++                out, reference, native, torch_fn, flops = OPERATORS[name](cfg)
++                same, delta = difference(out, reference)
++                native_ms = timed(native, args.repeats, device)
++                torch_ms = timed(torch_fn, args.repeats, device)
++        except Exception as exc:  # noqa: BLE001
++            print(f"{name:<22} failed: {type(exc).__name__}: {str(exc)[:80]}", flush=True)
++            results.append({"operator": name, "error": f"{type(exc).__name__}: {exc}"})
++            continue
++        note = "" if same else f"max |diff| {delta:.3g}"
++        if flops:
++            note = (note + " " if note else "") + f"{flops / native_ms / 1e9:.1f} TFLOPS"
++        print(f"{name:<22} {native_ms:10.3f}m {torch_ms:9.3f}m {torch_ms / native_ms:6.2f}x "
++              f"{str(same):>7}  {note}", flush=True)
++        results.append({"operator": name, "infinicore_ms": native_ms, "torch_ms": torch_ms,
++                        "ratio": torch_ms / native_ms, "bitwise_equal": same,
++                        "max_abs_difference": delta, "flops": flops})
++    if args.json:
++        args.json.write_text(json.dumps({"environment": environment, "results": results,
++                                         "diagnostic_only": True}, indent=2) + "\n")
++        print(f"wrote {args.json}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/bench_p2p_sdma.py b/tools/bench_p2p_sdma.py
+new file mode 100644
+index 0000000..524f40c
+--- /dev/null
++++ b/tools/bench_p2p_sdma.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""Peer-to-peer copy-engine (SDMA) bandwidth and its interference with compute.
++
++Single process, all visible devices. Measures
++  1. hipMemcpyPeerAsync bandwidth per ordered device pair (one copy at a time);
++  2. an all-to-all pattern (every device sends one block to every peer at once);
++  3. GEMM time on all devices alone, while the copy engines run the all-to-all
++     pattern, so it can be compared with RCCL all-to-all (bench_rccl_interference.py).
++Diagnostic only; not used by the generation path.
++"""
++import argparse
++import ctypes
++import json
++import time
++
++import torch
++
++hip = ctypes.CDLL("libamdhip64.so")
++
++
++def check(status, what):
++    if status != 0:
++        raise RuntimeError(f"{what} failed with HIP error {status}")
++
++
++def enable_peer_access(devices):
++    access = {}
++    for i in devices:
++        check(hip.hipSetDevice(i), "hipSetDevice")
++        for j in devices:
++            if i == j:
++                continue
++            can = ctypes.c_int(0)
++            check(hip.hipDeviceCanAccessPeer(ctypes.byref(can), i, j), "hipDeviceCanAccessPeer")
++            access[f"{i}->{j}"] = bool(can.value)
++            if can.value:
++                status = hip.hipDeviceEnablePeerAccess(j, 0)
++                if status not in (0, 704):  # 704: already enabled
++                    raise RuntimeError(f"hipDeviceEnablePeerAccess({i}->{j}) = {status}")
++    return access
++
++
++def peer_copy(dst, dst_dev, src, src_dev, nbytes, stream):
++    check(hip.hipMemcpyPeerAsync(ctypes.c_void_p(dst.data_ptr()), dst_dev,
++                                 ctypes.c_void_p(src.data_ptr()), src_dev,
++                                 ctypes.c_size_t(nbytes), ctypes.c_void_p(stream.cuda_stream)),
++          "hipMemcpyPeerAsync")
++
++
++def sync_all(devices):
++    for d in devices:
++        torch.cuda.synchronize(d)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--block-mib", default="10,31,100")
++    parser.add_argument("--gemm", default="5728,10752,5376")  # SP4 QKV group shape (M,N,K)
++    parser.add_argument("--output")
++    args = parser.parse_args()
++    devices = list(range(torch.cuda.device_count()))
++    result = {"devices": devices, "peer_access": enable_peer_access(devices)}
++    streams = {d: torch.cuda.Stream(device=d) for d in devices}
++
++    # 1. Pairwise bandwidth.
++    nbytes = 256 << 20
++    bufs = {d: (torch.empty(nbytes, dtype=torch.uint8, device=d),
++                torch.empty(nbytes, dtype=torch.uint8, device=d)) for d in devices}
++    pair = {}
++    for i in devices:
++        for j in devices:
++            if i == j:
++                continue
++            peer_copy(bufs[j][1], j, bufs[i][0], i, nbytes, streams[i])
++            sync_all(devices)
++            start = time.perf_counter()
++            for _ in range(5):
++                peer_copy(bufs[j][1], j, bufs[i][0], i, nbytes, streams[i])
++            sync_all(devices)
++            pair[f"{i}->{j}"] = round(5 * nbytes / (time.perf_counter() - start) / 1e9, 2)
++    result["pair_GBps"] = pair
++    print(json.dumps({"pair_GBps": pair}), flush=True)
++
++    # 2. All-to-all pattern: device i sends block b to every peer j concurrently.
++    def all_to_all(src, dst, block):
++        for i in devices:
++            for j in devices:
++                if i != j:
++                    peer_copy(dst[j][i], j, src[i][j], i, block, streams[i])
++
++    a2a = {}
++    for mib in map(float, args.block_mib.split(",")):
++        block = int(mib * (1 << 20))
++        src = {i: {j: torch.empty(block, dtype=torch.uint8, device=i) for j in devices} for i in devices}
++        dst = {j: {i: torch.empty(block, dtype=torch.uint8, device=j) for i in devices} for j in devices}
++        all_to_all(src, dst, block)
++        sync_all(devices)
++        start = time.perf_counter()
++        for _ in range(5):
++            all_to_all(src, dst, block)
++        sync_all(devices)
++        seconds = (time.perf_counter() - start) / 5
++        a2a[str(mib)] = {"seconds": seconds,
++                         "per_rank_send_GBps": round((len(devices) - 1) * block / seconds / 1e9, 2)}
++        print(json.dumps({"all_to_all_block_MiB": mib, **a2a[str(mib)]}), flush=True)
++        del src, dst
++    result["all_to_all"] = a2a
++
++    # 3. GEMM interference.
++    m, n, k = map(int, args.gemm.split(","))
++    mats = {d: (torch.randn(m, k, device=d, dtype=torch.bfloat16),
++                torch.randn(n, k, device=d, dtype=torch.bfloat16)) for d in devices}
++    gemm_streams = {d: torch.cuda.Stream(device=d) for d in devices}
++
++    def gemms(reps):
++        for d in devices:
++            with torch.cuda.device(d), torch.cuda.stream(gemm_streams[d]):
++                a, b = mats[d]
++                for _ in range(reps):
++                    torch.mm(a, b.t())
++
++    reps = 40
++    gemms(2)
++    sync_all(devices)
++    start = time.perf_counter()
++    gemms(reps)
++    sync_all(devices)
++    alone = (time.perf_counter() - start) / reps
++    block = 31 << 20
++    src = {i: {j: torch.empty(block, dtype=torch.uint8, device=i) for j in devices} for i in devices}
++    dst = {j: {i: torch.empty(block, dtype=torch.uint8, device=j) for i in devices} for j in devices}
++    sync_all(devices)
++    start = time.perf_counter()
++    gemms(reps)
++    for _ in range(12):
++        all_to_all(src, dst, block)
++    sync_all(devices)
++    both = time.perf_counter() - start
++    # Copies alone for the same amount, to see how much overlapped.
++    start = time.perf_counter()
++    for _ in range(12):
++        all_to_all(src, dst, block)
++    sync_all(devices)
++    copies = time.perf_counter() - start
++    flops = 2 * m * n * k
++    result["gemm_interference"] = {
++        "gemm_ms_alone": alone * 1e3, "gemm_TFLOPS_alone": flops / alone / 1e12,
++        "gemms_plus_copies_s": both, "gemms_alone_s": alone * reps, "copies_alone_s": copies}
++    print(json.dumps(result["gemm_interference"]), flush=True)
++    if args.output:
++        with open(args.output, "w") as f:
++            json.dump(result, f, indent=2)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/bench_qk_norm_rope.py b/tools/bench_qk_norm_rope.py
+new file mode 100644
+index 0000000..f6577d1
+--- /dev/null
++++ b/tools/bench_qk_norm_rope.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++"""Diagnostic: the block-tiled q/k RMSNorm + RoPE NineToothed kernel against the
++one-token-per-program kernel, on the SP4 layout (strided source view of the
++fused QKV projection, permuted send buffer): bitwise check and timing."""
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++sys.path[:0] = [str(Path(__file__).resolve().parents[1] / "ninetoothed/src"), str(Path(__file__).resolve().parent)]
++from h3_pointwise import make_qk_norm_rope  # noqa: E402
++
++T, P, HS, D = 5726, 4, 7, 128
++torch.manual_seed(0)
++dev = "cuda:1"
++projected = torch.randn(T, 3, P * HS, D, device=dev, dtype=torch.bfloat16)
++source = projected[:, 0]                        # [T, P*Hs, D], token stride 3*P*Hs*D
++by_rank = source.as_strided((T, P, HS, D), (source.stride(0), HS * source.stride(1), source.stride(1), 1))
++weight = (torch.rand(D, device=dev) + 0.5).to(torch.bfloat16)
++cos = torch.rand(T, 48, device=dev).to(torch.bfloat16)
++sin = torch.rand(T, 48, device=dev).to(torch.bfloat16)
++
++
++def run(kernel):
++    out = torch.empty(P, T, HS, D, device=dev, dtype=torch.bfloat16)
++    y = out.permute(1, 0, 2, 3)
++    with torch.cuda.device(dev):
++        kernel(by_rank, by_rank, by_rank, weight, weight, weight, 1e-5, cos, sin, y, y, y)
++    return out
++
++
++def bench(kernel):
++    for _ in range(3):
++        run(kernel)
++    torch.cuda.synchronize(dev)
++    start = time.perf_counter()
++    for _ in range(50):
++        run(kernel)
++    torch.cuda.synchronize(dev)
++    return (time.perf_counter() - start) / 50
++
++
++import tempfile
++build = Path(tempfile.mkdtemp(prefix="qk_aot_"))
++arch = torch.cuda.get_device_properties(dev).gcnArchName.split(":")[0]
++
++
++def make(**options):
++    out_dir = build / "_".join(f"{k}{v}" for k, v in options.items())
++    out_dir.mkdir()
++    return make_qk_norm_rope(caller="hip", output_dir=out_dir, archs=[arch], **options)
++
++
++reference = make(block_tokens=1, num_warps=1)
++print("reference built", flush=True)
++expected = run(reference)
++print(f"current (1 token, 1 rank, 1 warp): {bench(reference) * 1e3:.3f} ms", flush=True)
++configs = [tuple(int(v) for v in c.split(",")) for c in sys.argv[1:]] or [(1, 4, 8, 1), (1, 4, 8, 2), (1, 4, 8, 4)]
++for bt, ranks, rows, nw in configs:
++    try:
++        kernel = make(block_tokens=bt, ranks=ranks, rows=rows, num_warps=nw)
++        same = torch.equal(run(kernel), expected)
++        print(f"bt{bt} ranks{ranks} rows{rows} w{nw}: {bench(kernel) * 1e3:.3f} ms bitwise {same}", flush=True)
++    except Exception as exc:  # noqa: BLE001
++        print(f"bt{bt} ranks{ranks} rows{rows} w{nw}: failed {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+diff --git a/tools/bench_rccl_interference.py b/tools/bench_rccl_interference.py
+new file mode 100644
+index 0000000..90feb81
+--- /dev/null
++++ b/tools/bench_rccl_interference.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""RCCL all-to-all vs GEMM interference, the counterpart of bench_p2p_sdma.py.
++
++torchrun --standalone --nproc_per_node=4 tools/bench_rccl_interference.py
++Same pattern: every rank sends a 31 MiB block to every peer, 12 times, while a
++GEMM loop runs on another stream. Diagnostic only.
++"""
++import argparse
++import datetime
++import json
++import os
++import time
++
++import torch
++import torch.distributed as dist
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gemm", default="5728,10752,5376")
++    parser.add_argument("--block-mib", type=float, default=31)
++    args = parser.parse_args()
++    rank = int(os.environ["LOCAL_RANK"])
++    world = int(os.environ["WORLD_SIZE"])
++    torch.cuda.set_device(rank)
++    dist.init_process_group("nccl", timeout=datetime.timedelta(seconds=120))
++    block = int(args.block_mib * (1 << 20)) // 2
++    src = torch.empty(block * world, dtype=torch.bfloat16, device="cuda")
++    dst = torch.empty_like(src)
++    m, n, k = map(int, args.gemm.split(","))
++    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
++    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
++    comm = torch.cuda.Stream()
++    gemm = torch.cuda.Stream()
++    reps = 40
++
++    def gemms(count):
++        with torch.cuda.stream(gemm):
++            for _ in range(count):
++                torch.mm(a, b.t())
++
++    def exchanges(count):
++        with torch.cuda.stream(comm):
++            for _ in range(count):
++                dist.all_to_all_single(dst, src)
++
++    exchanges(2)
++    gemms(2)
++    torch.cuda.synchronize()
++    dist.barrier()
++    start = time.perf_counter()
++    gemms(reps)
++    torch.cuda.synchronize()
++    alone = time.perf_counter() - start
++    dist.barrier()
++    start = time.perf_counter()
++    exchanges(12)
++    torch.cuda.synchronize()
++    comm_alone = time.perf_counter() - start
++    dist.barrier()
++    start = time.perf_counter()
++    gemms(reps)
++    exchanges(12)
++    torch.cuda.synchronize()
++    both = time.perf_counter() - start
++    row = {"rank": rank, "gemms_alone_s": alone, "copies_alone_s": comm_alone,
++           "gemms_plus_copies_s": both,
++           "per_rank_send_GBps": round(12 * (world - 1) * block * 2 / comm_alone / 1e9, 2)}
++    rows = [None] * world
++    dist.all_gather_object(rows, row)
++    if rank == 0:
++        print(json.dumps(rows), flush=True)
++    dist.destroy_process_group()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/bench_swiglu.py b/tools/bench_swiglu.py
+new file mode 100644
+index 0000000..8fd3010
+--- /dev/null
++++ b/tools/bench_swiglu.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++"""Diagnostic: tile shapes / warps of the H3 SwiGLU NineToothed kernel on the
++SP4 shape (up/gate halves of the [1, 5726, 28672] gate_up output): bitwise
++check against the current configuration and timing. Never used by generation."""
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++import torch
++
++sys.path[:0] = [str(Path(__file__).resolve().parents[1] / "ninetoothed/src"), str(Path(__file__).resolve().parent)]
++from h3_pointwise import make_swiglu  # noqa: E402
++
++T, F = 5726, 14336
++dev = "cuda:1"
++torch.manual_seed(0)
++gate_up = (torch.randn(1, T, 2 * F, device=dev) * 2).to(torch.bfloat16)
++up, gate = gate_up[..., :F], gate_up[..., F:]
++build = Path(tempfile.mkdtemp(prefix="swiglu_aot_"))
++arch = torch.cuda.get_device_properties(dev).gcnArchName.split(":")[0]
++
++
++def make(**options):
++    out_dir = build / "_".join(f"{k}{v}" for k, v in options.items())
++    out_dir.mkdir()
++    return make_swiglu(caller="hip", output_dir=out_dir, archs=[arch], **options)
++
++
++def run(kernel):
++    out = torch.empty(1, T, F, device=dev, dtype=torch.bfloat16)
++    with torch.cuda.device(dev):
++        kernel(up, gate, out)
++    return out
++
++
++def bench(kernel):
++    out = torch.empty(1, T, F, device=dev, dtype=torch.bfloat16)
++    with torch.cuda.device(dev):
++        for _ in range(3):
++            kernel(up, gate, out)
++        torch.cuda.synchronize(dev)
++        start = time.perf_counter()
++        for _ in range(50):
++            kernel(up, gate, out)
++        torch.cuda.synchronize(dev)
++    return (time.perf_counter() - start) / 50
++
++
++reference = make(rows=16, cols=256, num_warps=4)
++expected = run(reference)
++print(f"current rows16 cols256 w4: {bench(reference) * 1e3:.3f} ms", flush=True)
++configs = [tuple(int(v) for v in c.split(",")) for c in sys.argv[1:]] or [
++    (1, 1024, 4), (1, 2048, 8), (2, 1024, 4), (4, 512, 4), (4, 1024, 8), (8, 512, 8),
++    (8, 256, 4), (16, 512, 8), (32, 128, 4), (2, 2048, 8), (1, 4096, 8)]
++for rows, cols, warps in configs:
++    try:
++        kernel = make(rows=rows, cols=cols, num_warps=warps)
++        same = torch.equal(run(kernel), expected)
++        print(f"rows{rows} cols{cols} w{warps}: {bench(kernel) * 1e3:.3f} ms bitwise {same}", flush=True)
++    except Exception as exc:  # noqa: BLE001
++        print(f"rows{rows} cols{cols} w{warps}: failed {type(exc).__name__}: {str(exc)[:120]}", flush=True)
+diff --git a/tools/bench_vae_decode.py b/tools/bench_vae_decode.py
+new file mode 100644
+index 0000000..68fd3dd
+--- /dev/null
++++ b/tools/bench_vae_decode.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""Diagnostic: time the H3 video VAE decode (the pipeline's tiled decode with
++the tile-parallel scheduler) on random latents of a real shape, optionally
++saving / comparing the decoded video. Never used by generation."""
++import argparse
++import time
++from pathlib import Path
++
++import torch
++from diffusers import AutoencoderKLMiniMaxH3
++from infinilm.multimodal.minimax_h3_vae_parallel import install_parallel_vae_decode
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model-path", type=Path, required=True)
++    parser.add_argument("--gpus", default="0,1,2,3")
++    parser.add_argument("--latent", default="37,48,48", help="frames,height,width of the latent")
++    parser.add_argument("--repeats", type=int, default=3)
++    parser.add_argument("--save", type=Path)
++    parser.add_argument("--compare", type=Path)
++    parser.add_argument("--cudnn-benchmark", action="store_true",
++                        help="torch.backends.cudnn.benchmark (MIOpen find per new shape)")
++    args = parser.parse_args()
++    torch.backends.cudnn.benchmark = args.cudnn_benchmark
++    devices = [int(d) for d in args.gpus.split(",")]
++    vae = AutoencoderKLMiniMaxH3.from_pretrained(args.model_path / "vae", local_files_only=True)
++    vae.to(f"cuda:{devices[0]}")
++    vae.to(dtype=torch.bfloat16).requires_grad_(False).eval()
++    install_parallel_vae_decode(vae, devices)
++    frames, height, width = map(int, args.latent.split(","))
++    generator = torch.Generator("cpu").manual_seed(0)
++    z = torch.randn(1, 24, frames, height, width, generator=generator).to(f"cuda:{devices[0]}", torch.bfloat16)
++    times = []
++    with torch.inference_mode():
++        for i in range(args.repeats + 1):
++            for d in devices:
++                torch.cuda.synchronize(d)
++            start = time.perf_counter()
++            # The pipeline decodes under fp16 autocast (decoders.py).
++            with torch.autocast(device_type="cuda", dtype=torch.float16):
++                video = vae.decode(z, return_dict=False)[0]
++            for d in devices:
++                torch.cuda.synchronize(d)
++            if i:
++                times.append(time.perf_counter() - start)
++    print(f"decode {tuple(video.shape)}: {[round(t, 3) for t in times]} s", flush=True)
++    if args.save:
++        torch.save(video.cpu(), args.save)
++    if args.compare:
++        ref = torch.load(args.compare)
++        out = video.cpu()
++        rel = float((out.float() - ref.float()).norm() / ref.float().norm())
++        print(f"bitwise {torch.equal(out, ref)} rel_l2 {rel:.3e} max_abs {float((out.float() - ref.float()).abs().max()):.3e}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/check_dit_determinism.py b/tools/check_dit_determinism.py
+new file mode 100644
+index 0000000..b799341
+--- /dev/null
++++ b/tools/check_dit_determinism.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""Diagnostic: run the native DiT N times on one captured input inside one
++process and report which outputs are bitwise identical (and the relative L2
++of each to the first). Never used by generation."""
++import argparse
++import hashlib
++from pathlib import Path
++
++import torch
++from infinilm.multimodal.minimax_h3 import MiniMaxH3DiffusersAdapter, MiniMaxH3TransformerRunner
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model-path", type=Path, required=True)
++    parser.add_argument("--input-dump", type=Path, required=True)
++    parser.add_argument("--gpus", default="0,1,2,3")
++    parser.add_argument("--runs", type=int, default=4)
++    args = parser.parse_args()
++    devices = [int(d) for d in args.gpus.split(",")]
++    captured = torch.load(args.input_dump, weights_only=True)
++    inputs = {k: v.to(f"cuda:{devices[0]}") for k, v in captured["inputs"].items()}
++    runner = MiniMaxH3TransformerRunner(args.model_path / "transformer", device="nvidia",
++                                        tp_device_ids=devices)
++    adapter = MiniMaxH3DiffusersAdapter(runner)
++    outputs = []
++    with torch.inference_mode():
++        def input_digest():
++            torch.cuda.synchronize(devices[0])
++            return {k: hashlib.sha256(v.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()[:12]
++                    for k, v in inputs.items()}
++        base = input_digest()
++        print("timestep", inputs["timestep"].tolist(), flush=True)
++        for i in range(args.runs):
++            out = adapter(**inputs)
++            changed = [k for k, v in input_digest().items() if v != base[k]]
++            if changed:
++                print(f"run {i}: inputs changed by the forward: {changed}", flush=True)
++            video = out.sample.float().cpu()
++            digest = hashlib.sha256(out.sample.cpu().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
++            rel = 0.0 if not outputs else float((video - outputs[0]).norm() / outputs[0].norm())
++            outputs.append(video)
++            print(f"run {i}: sha {digest} rel_l2_vs_run0 {rel:.6f}", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/check_gemm_determinism.py b/tools/check_gemm_determinism.py
+new file mode 100644
+index 0000000..a641ee0
+--- /dev/null
++++ b/tools/check_gemm_determinism.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""Diagnostic: is InfiniCore's linear (and PyTorch's mm) bitwise repeatable on
++the H3 SP shapes? Runs each GEMM several times on one device and reports
++whether the outputs match the first run. Never used by generation."""
++import os
++
++import torch
++
++os.environ.setdefault("H3_DETERMINISTIC_BLAS", "1")
++import infinicore  # noqa: E402
++import infinicore.nn.functional as F  # noqa: E402
++
++SHAPES = {  # name: (M, N, K, dtype)
++    "qkv_group": (5726, 10752, 5376, torch.bfloat16),
++    "out": (5726, 5376, 7168, torch.bfloat16),
++    "gate_up": (5726, 28672, 5376, torch.bfloat16),
++    "down": (5726, 5376, 14336, torch.bfloat16),
++    "adaln": (3, 24192, 2688, torch.bfloat16),
++    "time_1": (2, 5376, 256, torch.float32),
++    "time_2": (2, 2688, 5376, torch.float32),
++    "refiner_qkv": (599, 21504, 5376, torch.bfloat16),
++}
++
++
++def main():
++    device = 1
++    torch.cuda.set_device(device)
++    infinicore.set_device(infinicore.device("cuda", device))
++    torch.manual_seed(0)
++    for name, (m, n, k, dtype) in SHAPES.items():
++        a = torch.randn(m, k, device=f"cuda:{device}", dtype=dtype)
++        w = torch.randn(n, k, device=f"cuda:{device}", dtype=dtype)
++        ia, iw = infinicore.from_torch(a), infinicore.from_torch(w)
++        ref_ic = ref_t = None
++        same_ic = same_t = 0
++        for i in range(6):
++            out = torch.empty(m, n, device=f"cuda:{device}", dtype=dtype)
++            F.linear(ia, iw, out=infinicore.from_torch(out))
++            infinicore.sync_device()
++            t = torch.mm(a, w.t())
++            torch.cuda.synchronize(device)
++            if i == 0:
++                ref_ic, ref_t = out.clone(), t.clone()
++            else:
++                same_ic += int(torch.equal(out, ref_ic))
++                same_t += int(torch.equal(t, ref_t))
++        print(f"{name:12s} infinicore repeat-equal {same_ic}/5   torch repeat-equal {same_t}/5   "
++              f"ic-vs-torch equal {torch.equal(ref_ic, ref_t)}", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/check_temb_determinism.py b/tools/check_temb_determinism.py
+new file mode 100644
+index 0000000..e105d3f
+--- /dev/null
++++ b/tools/check_temb_determinism.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""Diagnostic: repeat the H3 time embedder chain (timestep_embedding ->
++F32 linear+bias -> silu -> F32 linear+bias) with InfiniCore on one device and
++check bitwise repeatability of each stage. Never used by generation."""
++import os
++
++import torch
++
++os.environ.setdefault("H3_DETERMINISTIC_BLAS", "1")
++import infinicore  # noqa: E402
++import infinicore.nn.functional as F  # noqa: E402
++from infinicore.ops.timestep_embedding import timestep_embedding  # noqa: E402
++
++
++def to_t(x):
++    out = torch.empty(tuple(x.shape), dtype=infinicore.utils.to_torch_dtype(x.dtype), device="cuda:1")
++    infinicore.from_torch(out).copy_(x)
++    infinicore.sync_device()
++    return out
++
++
++def main():
++    torch.cuda.set_device(1)
++    infinicore.set_device(infinicore.device("cuda", 1))
++    torch.manual_seed(0)
++    t = torch.tensor([0.37, 0.91], device="cuda:1", dtype=torch.float32)
++    w1 = torch.randn(5376, 256, device="cuda:1") * 0.05
++    b1 = torch.randn(5376, device="cuda:1") * 0.05
++    w2 = torch.randn(2688, 5376, device="cuda:1") * 0.01
++    b2 = torch.randn(2688, device="cuda:1") * 0.01
++    it, iw1, ib1, iw2, ib2 = (infinicore.from_torch(x) for x in (t, w1, b1, w2, b2))
++    refs = None
++    same = [0, 0, 0, 0]
++    for i in range(8):
++        e = timestep_embedding(it, 256)
++        h = F.linear(e, iw1, ib1)
++        s = F.silu(h)
++        o = F.linear(s, iw2, ib2)
++        stages = [to_t(x) for x in (e, h, s, o)]
++        if refs is None:
++            refs = stages
++        else:
++            for j in range(4):
++                same[j] += int(torch.equal(stages[j], refs[j]))
++    print("repeat-equal (of 7): embedding %d, linear_1 %d, silu %d, linear_2 %d" % tuple(same))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/check_video_postprocess.py b/tools/check_video_postprocess.py
+new file mode 100644
+index 0000000..cd8c750
+--- /dev/null
++++ b/tools/check_video_postprocess.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""Diagnostic: device-side PIL postprocessing (install_video_postprocess) vs the
++released VideoProcessor.postprocess_video: identical pixels, and the time of each."""
++import time
++
++import numpy as np
++import torch
++from diffusers.video_processor import VideoProcessor
++
++from infinilm.multimodal.minimax_h3_vae_parallel import install_video_postprocess
++
++
++def main():
++    torch.manual_seed(0)
++    video = torch.rand(1, 3, 124, 768, 768, device="cuda")
++    # exact .5 / 255 boundaries and the clamp ends, where rounding could differ
++    video[0, :, :4] = (torch.randint(0, 511, (3, 4, 768, 768), device="cuda").float() / 510)
++    video[0, 0, 4] = 0.0
++    video[0, 1, 4] = 1.0
++    reference_processor = VideoProcessor(vae_scale_factor=16, do_normalize=False)
++    fast_processor = VideoProcessor(vae_scale_factor=16, do_normalize=False)
++    install_video_postprocess(fast_processor)
++    results = {}
++    for name, processor in (("released", reference_processor), ("device", fast_processor)):
++        processor.postprocess_video(video[:, :, :8], output_type="pil")
++        torch.cuda.synchronize()
++        started = time.perf_counter()
++        frames = processor.postprocess_video(video, output_type="pil")
++        results[name] = (time.perf_counter() - started, frames)
++    ref, new = results["released"][1], results["device"][1]
++    same = len(ref) == len(new) and all(
++        len(a) == len(b) and all(x.mode == y.mode and np.array_equal(np.asarray(x), np.asarray(y))
++                                 for x, y in zip(a, b)) for a, b in zip(ref, new))
++    print(f"released {results['released'][0]:.3f} s, device {results['device'][0]:.3f} s, "
++          f"frames {len(new[0])}, identical pixels {same}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/compare_traces.py b/tools/compare_traces.py
+new file mode 100644
+index 0000000..1cdddb7
+--- /dev/null
++++ b/tools/compare_traces.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""Diagnostic: compare two tools/trace_pipeline.py traces call by call and
++report the first call (in execution order) whose inputs or output differ.
++Never used by generation.
++
++usage: compare_traces.py A.jsonl B.jsonl [C.jsonl ...]   (each against A)
++"""
++import json
++import sys
++
++
++def flatten(value, prefix=""):
++    if isinstance(value, dict):
++        for key, item in value.items():
++            yield from flatten(item, f"{prefix}.{key}" if prefix else key)
++    elif isinstance(value, list):
++        for index, item in enumerate(value):
++            yield from flatten(item, f"{prefix}[{index}]")
++    else:
++        yield prefix, value
++
++
++def load(path):
++    with open(path) as handle:
++        return [json.loads(line) for line in handle if line.strip()]
++
++
++def compare(a_path, b_path):
++    a, b = load(a_path), load(b_path)
++    print(f"{b_path} vs {a_path}: {len(b)} / {len(a)} calls")
++    for ra, rb in zip(a, b):
++        name = f"{ra['call']}#{ra['index']}"
++        if (ra["call"], ra["index"]) != (rb["call"], rb["index"]):
++            print(f"  call order differs at {name} vs {rb['call']}#{rb['index']}")
++            return
++        for part in ("args", "kwargs", "output"):
++            fa, fb = dict(flatten(ra[part])), dict(flatten(rb[part]))
++            differing = [key for key in fa if fa.get(key) != fb.get(key)]
++            if differing:
++                print(f"  first difference: {name} {part}: {', '.join(differing[:6])}")
++                return
++    print("  identical")
++
++
++for other in sys.argv[2:]:
++    compare(sys.argv[1], other)
+diff --git a/tools/find_divergence.py b/tools/find_divergence.py
+new file mode 100644
+index 0000000..2681a8d
+--- /dev/null
++++ b/tools/find_divergence.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""Diagnostic: run the native DiT twice on one captured input with
++H3_TRACE_DIR pointing at two directories, then list the traced tensors in
++execution order with whether the two runs agree bitwise. Never used by
++generation."""
++import argparse
++import os
++from pathlib import Path
++
++import numpy as np
++import torch
++from infinilm.multimodal.minimax_h3 import MiniMaxH3DiffusersAdapter, MiniMaxH3TransformerRunner
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model-path", type=Path, required=True)
++    parser.add_argument("--input-dump", type=Path, required=True)
++    parser.add_argument("--out", type=Path, required=True)
++    parser.add_argument("--gpus", default="0,1,2,3")
++    parser.add_argument("--runs", type=int, default=3)
++    args = parser.parse_args()
++    devices = [int(d) for d in args.gpus.split(",")]
++    captured = torch.load(args.input_dump, weights_only=True)
++    inputs = {k: v.to(f"cuda:{devices[0]}") for k, v in captured["inputs"].items()}
++    runner = MiniMaxH3TransformerRunner(args.model_path / "transformer", device="nvidia",
++                                        tp_device_ids=devices)
++    adapter = MiniMaxH3DiffusersAdapter(runner)
++    dirs = []
++    with torch.inference_mode():
++        adapter(**inputs)  # first forward (synchronous collectives) untraced
++        for i in range(args.runs):
++            d = args.out / f"run{i}"
++            d.mkdir(parents=True, exist_ok=True)
++            os.environ["H3_TRACE_DIR"] = str(d)
++            os.environ.setdefault("H3_TRACE_TOKENS", "4096")
++            adapter(**inputs)
++            dirs.append(d)
++    os.environ.pop("H3_TRACE_DIR", None)
++    names = sorted((p.name for p in dirs[0].iterdir()), key=lambda n: (dirs[0] / n).stat().st_mtime)
++    for name in names:
++        ref = np.fromfile(dirs[0] / name, dtype=np.uint8)
++        status = []
++        for d in dirs[1:]:
++            other = np.fromfile(d / name, dtype=np.uint8)
++            status.append("same" if other.size == ref.size and np.array_equal(other, ref) else "DIFF")
++        print(f"{name:40s} {' '.join(status)}", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/h3_attention.py b/tools/h3_attention.py
+index ed7b998..81e754b 100644
+--- a/tools/h3_attention.py
++++ b/tools/h3_attention.py
+@@ -103,13 +103,14 @@ def application_prescale(q, k, v, scale, o):
+ 
+ def make_attention(block_m=128, block_n=32, num_warps=4, num_stages=1,
+                    caller="torch", output_dir=None, archs=None, backend_options=None,
+-                   kernel_name="h3_full_attention", numerics="fp32_qk", head_dim=128):
++                   kernel_name="h3_full_attention", numerics="fp32_qk", head_dim=128,
++                   dtype=ninetoothed.bfloat16):
+     # B,H,S are dynamic; D is the model's actual head dimension, not a padded approximation.
+     if head_dim <= 0:
+         raise ValueError("head_dim must be positive")
+-    tensors = tuple(Tensor(shape=(None, None, None, head_dim), dtype=ninetoothed.bfloat16)
++    tensors = tuple(Tensor(shape=(None, None, None, head_dim), dtype=dtype)
+                     for _ in range(3)) + (Tensor(0, dtype=ninetoothed.float64),
+-                    Tensor(shape=(None, None, None, head_dim), dtype=ninetoothed.bfloat16))
++                    Tensor(shape=(None, None, None, head_dim), dtype=dtype))
+     applications = {"fp32_qk": application, "bf16_prescale": application_prescale,
+                     "fp32_qk_dotacc": application_dotacc, "fp32_qk_split": application_split}
+     if numerics not in applications:
+diff --git a/tools/h3_pointwise.py b/tools/h3_pointwise.py
+index 8ccb287..b3f4641 100644
+--- a/tools/h3_pointwise.py
++++ b/tools/h3_pointwise.py
+@@ -3,12 +3,13 @@ import functools
+ import ninetoothed
+ import ninetoothed.language as ntl
+ from ninetoothed import Tensor
++from ninetoothed.language import libdevice
+ 
+ 
+-def swiglu_arrange(up, gate, out):
++def swiglu_arrange(up, gate, out, rows=16, cols=256):
+     arranged = []
+     for tensor in (up, gate, out):
+-        tiled = tensor.tile((1, 16, 256))
++        tiled = tensor.tile((1, rows, cols))
+         tiled.dtype = tiled.dtype.squeeze(0)
+         arranged.append(tiled)
+     return tuple(arranged)
+@@ -21,11 +22,16 @@ def swiglu_apply(up, gate, out):
+     out = up * activated  # noqa: F841
+ 
+ 
+-def make_swiglu(caller="torch", output_dir=None, archs=None):
+-    return ninetoothed.make(swiglu_arrange, swiglu_apply,
+-        tuple(Tensor(3, dtype=ninetoothed.bfloat16) for _ in range(3)),
++def make_swiglu(caller="torch", output_dir=None, archs=None, rows=1, cols=1024, num_warps=4,
++                dtype=ninetoothed.bfloat16):
++    # One 1024-wide row slice per program, 4 elements per lane: 0.885 ms vs
++    # 1.25 ms (16x256 tiles) on the SP4 [1, 5726, 14336] halves on K100-AI,
++    # bitwise identical (tools/bench_swiglu.py; 2 or 8 elements per lane are
++    # all slower).
++    return ninetoothed.make(functools.partial(swiglu_arrange, rows=rows, cols=cols), swiglu_apply,
++        tuple(Tensor(3, dtype=dtype) for _ in range(3)),
+         caller=caller, output_dir=output_dir, archs=archs,
+-        kernel_name="h3_swiglu_exact", num_warps=4, num_stages=1)
++        kernel_name="h3_swiglu_exact", num_warps=num_warps, num_stages=1)
+ 
+ 
+ def rms_arrange(x, weight, eps, out, block):
+@@ -51,13 +57,14 @@ def rms_apply(x, weight, eps, out):
+     out = normalized * weight  # noqa: F841
+ 
+ 
+-def make_rms(caller="torch", output_dir=None, archs=None, width=5376):
++def make_rms(caller="torch", output_dir=None, archs=None, width=5376,
++             dtype=ninetoothed.bfloat16):
+     shape = (None, None, width)
+     return ninetoothed.make(functools.partial(rms_arrange, block=1 << (width - 1).bit_length()), rms_apply,
+-        (Tensor(shape=shape, dtype=ninetoothed.bfloat16),
+-         Tensor(shape=(width,), dtype=ninetoothed.bfloat16),
++        (Tensor(shape=shape, dtype=dtype),
++         Tensor(shape=(width,), dtype=dtype),
+          Tensor(0, dtype=ninetoothed.float64),
+-         Tensor(shape=shape, dtype=ninetoothed.bfloat16)),
++         Tensor(shape=shape, dtype=dtype)),
+         caller=caller, output_dir=output_dir, archs=archs,
+         kernel_name="h3_rms_exact" + (f"_{width}" if width else ""),
+         num_warps=4, num_stages=1)
+@@ -90,11 +97,12 @@ def rms_modulate_apply(x, weight, eps, scale, shift, out):
+     out = product + shift  # noqa: F841
+ 
+ 
+-def make_rms_modulate(caller="torch", output_dir=None, archs=None):
++def make_rms_modulate(caller="torch", output_dir=None, archs=None,
++                      dtype=ninetoothed.bfloat16):
+     def activation():
+-        return Tensor(shape=(None, None, 5376), dtype=ninetoothed.bfloat16)
++        return Tensor(shape=(None, None, 5376), dtype=dtype)
+     return ninetoothed.make(rms_modulate_arrange, rms_modulate_apply,
+-        (activation(), Tensor(shape=(5376,), dtype=ninetoothed.bfloat16),
++        (activation(), Tensor(shape=(5376,), dtype=dtype),
+          Tensor(0, dtype=ninetoothed.float64), activation(), activation(), activation()),
+         caller=caller, output_dir=output_dir, archs=archs,
+         kernel_name="h3_rms_modulate_exact", num_warps=4, num_stages=1)
+@@ -116,11 +124,12 @@ def gated_residual_apply(x, gate, y, out):
+     out = x + product  # noqa: F841
+ 
+ 
+-def make_gated_residual(caller="torch", output_dir=None, archs=None, block=(4, 512), num_warps=8):
++def make_gated_residual(caller="torch", output_dir=None, archs=None, block=(4, 512), num_warps=8,
++                        dtype=ninetoothed.bfloat16):
+     # Pure elementwise: any tiling gives identical values; (4, 512)/8 warps is
+     # the fastest on gfx928 (tools/probe_gated_residual.py).
+     def activation():
+-        return Tensor(shape=(None, None, 5376), dtype=ninetoothed.bfloat16)
++        return Tensor(shape=(None, None, 5376), dtype=dtype)
+     return ninetoothed.make(functools.partial(gated_residual_arrange, block=block), gated_residual_apply,
+         tuple(activation() for _ in range(4)),
+         caller=caller, output_dir=output_dir, archs=archs,
+@@ -159,14 +168,15 @@ def gated_residual_rms_modulate_apply(x, gate, y, weight, eps, scale, shift, res
+     out = modulated + shift  # noqa: F841
+ 
+ 
+-def make_gated_residual_rms_modulate(caller="torch", output_dir=None, archs=None, num_warps=4):
++def make_gated_residual_rms_modulate(caller="torch", output_dir=None, archs=None, num_warps=4,
++                                     dtype=ninetoothed.bfloat16):
+     # Keep make_rms_modulate's 8192-wide rows and 4 warps: the FP32 sum of
+     # squares then reduces in the same order, so the result is bitwise the
+     # same as the unfused add + h3_rms_modulate.
+     def activation():
+-        return Tensor(shape=(None, None, 5376), dtype=ninetoothed.bfloat16)
++        return Tensor(shape=(None, None, 5376), dtype=dtype)
+     return ninetoothed.make(gated_residual_rms_modulate_arrange, gated_residual_rms_modulate_apply,
+-        (activation(), activation(), activation(), Tensor(shape=(5376,), dtype=ninetoothed.bfloat16),
++        (activation(), activation(), activation(), Tensor(shape=(5376,), dtype=dtype),
+          Tensor(0, dtype=ninetoothed.float64), activation(), activation(), activation(), activation()),
+         caller=caller, output_dir=output_dir, archs=archs,
+         kernel_name="h3_gated_residual_rms_modulate_exact", num_warps=num_warps, num_stages=1)
+@@ -204,15 +214,15 @@ def rope_apply(x0, x1, passthrough, cos, sin, y0, y1, ypass):
+     ypass = passthrough  # noqa: F841
+ 
+ 
+-def make_rope(caller="torch", output_dir=None, archs=None):
++def make_rope(caller="torch", output_dir=None, archs=None, dtype=ninetoothed.bfloat16):
+     # This NineToothed version requires distinct arguments for multiple views
+     # of one source. The caller aliases x0/x1/xp and y0/y1/yp respectively.
+     def activation():
+-        return Tensor(shape=(None, None, 128), dtype=ninetoothed.bfloat16)
++        return Tensor(shape=(None, None, 128), dtype=dtype)
+     kernel = ninetoothed.make(rope_arrange, rope_apply,
+         (activation(), activation(), activation(),
+-         Tensor(shape=(None, 48), dtype=ninetoothed.bfloat16),
+-         Tensor(shape=(None, 48), dtype=ninetoothed.bfloat16),
++         Tensor(shape=(None, 48), dtype=dtype),
++         Tensor(shape=(None, 48), dtype=dtype),
+          activation(), activation(), activation()),
+         caller=caller, output_dir=output_dir, archs=archs,
+         kernel_name="h3_rope_exact", num_warps=4, num_stages=1)
+@@ -221,13 +231,20 @@ def make_rope(caller="torch", output_dir=None, archs=None):
+     return launch
+ 
+ 
+-def qk_norm_rope_arrange(x0, x1, xp, w0, w1, wp, eps, cos, sin, y0, y1, yp, rows=8):
+-    # [T, P, Hs, 128] views; one program per (token, rank) handles `rows` heads.
++def qk_norm_rope_arrange(x0, x1, xp, w0, w1, wp, eps, cos, sin, y0, y1, yp, rows=8,
++                         block_tokens=1, ranks=1):
++    # [T, P, Hs, 128] views; one program per (token block, rank block) handles
++    # `block_tokens` tokens x `ranks` ranks x `rows` heads (block_tokens=1:
++    # one token; ranks=1: one rank).
++    if block_tokens == 1:
++        squeezed = (0, 1) if ranks == 1 else (0,)
++    else:
++        squeezed = (1,)
+     parts = []
+     for tensor in (x0[..., :48], x1[..., 48:96], xp[..., 96:],
+                    y0[..., :48], y1[..., 48:96], yp[..., 96:]):
+-        t = tensor.tile((1, 1, rows, 64))
+-        t.dtype = t.dtype.squeeze((0, 1))
++        t = tensor.tile((block_tokens, ranks, rows, 64))
++        t.dtype = t.dtype.squeeze(squeezed)
+         parts.append(t)
+     grid = parts[0].shape
+     weights = []
+@@ -235,8 +252,9 @@ def qk_norm_rope_arrange(x0, x1, xp, w0, w1, wp, eps, cos, sin, y0, y1, yp, rows
+         weights.append(tensor.tile((64,)).unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(grid))
+     angles = []
+     for tensor in (cos, sin):
+-        t = tensor.tile((1, 64))
+-        t.dtype = t.dtype.squeeze(0)
++        t = tensor.tile((block_tokens, 64))
++        if block_tokens == 1:
++            t.dtype = t.dtype.squeeze(0)
+         angles.append(t.unsqueeze(1).unsqueeze(1).expand((-1, grid[1], grid[2], -1)))
+     return (*parts[:3], *weights, eps, *angles, *parts[3:])
+ 
+@@ -276,19 +294,104 @@ def qk_norm_rope_apply(x0, x1, xp, w0, w1, wp, eps, cos, sin, y0, y1, yp):
+     yp = npass  # noqa: F841
+ 
+ 
+-def make_qk_norm_rope(caller="torch", output_dir=None, archs=None, rows=8, num_warps=2):
++def qk_norm_rope_ranks_apply(x0, x1, xp, w0, w1, wp, eps, cos, sin, y0, y1, yp):
++    # Same arithmetic as qk_norm_rope_apply on a [ranks, heads, 64] block of
++    # one token: per-head reductions over the last axis, angles broadcast.
++    a = x0
++    b = x1
++    p = xp
++    a = a.to(ntl.float32)
++    b = b.to(ntl.float32)
++    p = p.to(ntl.float32)
++    sa = (a * a).to(x0.dtype).to(ntl.float32)
++    sb = (b * b).to(x0.dtype).to(ntl.float32)
++    sp = (p * p).to(x0.dtype).to(ntl.float32)
++    sa = ntl.where(x0.offsets(-1) < 48, sa, 0.)
++    sb = ntl.where(x1.offsets(-1) < 96, sb, 0.)
++    sp = ntl.where(xp.offsets(-1) < 128, sp, 0.)
++    mean = ((ntl.sum(sa, 2) + ntl.sum(sb, 2) + ntl.sum(sp, 2)) / 128).to(x0.dtype)
++    epsilon = eps
++    epsilon = epsilon.to(ntl.float32).to(x0.dtype)
++    variance = (mean.to(ntl.float32) + epsilon.to(ntl.float32)).to(x0.dtype)
++    reciprocal = ntl.rsqrt(variance.to(ntl.float32)).to(x0.dtype).to(ntl.float32)
++    na = ((a * reciprocal[:, :, None]).to(x0.dtype) * w0).to(x0.dtype).to(ntl.float32)
++    nb = ((b * reciprocal[:, :, None]).to(x0.dtype) * w1).to(x0.dtype).to(ntl.float32)
++    npass = ((p * reciprocal[:, :, None]).to(x0.dtype) * wp).to(x0.dtype)
++    c = cos
++    s = sin
++    c = c.to(ntl.float32)
++    s = s.to(ntl.float32)
++    ac = (na * c).to(x0.dtype).to(ntl.float32)
++    bs = (-nb * s).to(x0.dtype).to(ntl.float32)
++    bc = (nb * c).to(x0.dtype).to(ntl.float32)
++    ass = (na * s).to(x0.dtype).to(ntl.float32)
++    y0 = ac + bs  # noqa: F841
++    y1 = bc + ass  # noqa: F841
++    yp = npass  # noqa: F841
++
++
++def qk_norm_rope_block_apply(x0, x1, xp, w0, w1, wp, eps, cos, sin, y0, y1, yp):
++    # Same arithmetic as qk_norm_rope_apply on a [tokens, heads, 64] block:
++    # the per-head reductions run over the last axis and the per-token angles
++    # broadcast over the heads.
++    a = x0
++    b = x1
++    p = xp
++    a = a.to(ntl.float32)
++    b = b.to(ntl.float32)
++    p = p.to(ntl.float32)
++    sa = (a * a).to(x0.dtype).to(ntl.float32)
++    sb = (b * b).to(x0.dtype).to(ntl.float32)
++    sp = (p * p).to(x0.dtype).to(ntl.float32)
++    sa = ntl.where(x0.offsets(-1) < 48, sa, 0.)
++    sb = ntl.where(x1.offsets(-1) < 96, sb, 0.)
++    sp = ntl.where(xp.offsets(-1) < 128, sp, 0.)
++    mean = ((ntl.sum(sa, 2) + ntl.sum(sb, 2) + ntl.sum(sp, 2)) / 128).to(x0.dtype)
++    epsilon = eps
++    epsilon = epsilon.to(ntl.float32).to(x0.dtype)
++    variance = (mean.to(ntl.float32) + epsilon.to(ntl.float32)).to(x0.dtype)
++    reciprocal = ntl.rsqrt(variance.to(ntl.float32)).to(x0.dtype).to(ntl.float32)
++    na = ((a * reciprocal[:, :, None]).to(x0.dtype) * w0).to(x0.dtype).to(ntl.float32)
++    nb = ((b * reciprocal[:, :, None]).to(x0.dtype) * w1).to(x0.dtype).to(ntl.float32)
++    npass = ((p * reciprocal[:, :, None]).to(x0.dtype) * wp).to(x0.dtype)
++    c = cos
++    s = sin
++    c = c.to(ntl.float32)[:, None, :]
++    s = s.to(ntl.float32)[:, None, :]
++    ac = (na * c).to(x0.dtype).to(ntl.float32)
++    bs = (-nb * s).to(x0.dtype).to(ntl.float32)
++    bc = (nb * c).to(x0.dtype).to(ntl.float32)
++    ass = (na * s).to(x0.dtype).to(ntl.float32)
++    y0 = ac + bs  # noqa: F841
++    y1 = bc + ass  # noqa: F841
++    yp = npass  # noqa: F841
++
++
++def make_qk_norm_rope(caller="torch", output_dir=None, archs=None, rows=8, num_warps=1,
++                      block_tokens=1, ranks=1, dtype=ninetoothed.bfloat16):
+     """Per-head RMSNorm (weight [128]) + 3-axis RoPE on [T, P, Hs, 128] (any
+     strides), written to another [T, P, Hs, 128] view (e.g. an all-to-all
+-    send buffer). Arguments: x, weight, eps, cos, sin ([T, 48]), out."""
++    send buffer). Arguments: x, weight, eps, cos, sin ([T, 48]), out.
++    ``block_tokens`` tokens x ``rows`` heads per program. Default: one token
++    per program on one warp, 0.391 ms vs 0.442 ms (num_warps=2) for the
++    S=22901 SP4 shape on K100-AI, bitwise identical; multi-token blocks were
++    all slower (tools/bench_qk_norm_rope.py)."""
+     def view4():
+-        return Tensor(shape=(None, None, None, 128), dtype=ninetoothed.bfloat16)
++        return Tensor(shape=(None, None, None, 128), dtype=dtype)
+     def weight():
+-        return Tensor(shape=(128,), dtype=ninetoothed.bfloat16)
+-    kernel = ninetoothed.make(functools.partial(qk_norm_rope_arrange, rows=rows), qk_norm_rope_apply,
++        return Tensor(shape=(128,), dtype=dtype)
++    if block_tokens == 1:
++        apply = qk_norm_rope_apply if ranks == 1 else qk_norm_rope_ranks_apply
++    elif ranks == 1:
++        apply = qk_norm_rope_block_apply
++    else:
++        raise ValueError("qk_norm_rope: block_tokens > 1 needs ranks == 1")
++    kernel = ninetoothed.make(functools.partial(qk_norm_rope_arrange, rows=rows,
++                                                block_tokens=block_tokens, ranks=ranks), apply,
+         (view4(), view4(), view4(), weight(), weight(), weight(),
+          Tensor(0, dtype=ninetoothed.float64),
+-         Tensor(shape=(None, 48), dtype=ninetoothed.bfloat16),
+-         Tensor(shape=(None, 48), dtype=ninetoothed.bfloat16),
++         Tensor(shape=(None, 48), dtype=dtype),
++         Tensor(shape=(None, 48), dtype=dtype),
+          view4(), view4(), view4()),
+         caller=caller, output_dir=output_dir, archs=archs,
+         kernel_name="h3_qk_norm_rope", num_warps=num_warps, num_stages=1)
+@@ -297,3 +400,43 @@ def make_qk_norm_rope(caller="torch", output_dir=None, archs=None, rows=8, num_w
+     def launch(x, weight, eps, cos, sin, out):
+         return kernel(x, x, x, weight, weight, weight, eps, cos, sin, out, out, out)
+     return launch
++
++
++def rope_cache_arrange(position, power, cos, sin, block_tokens=64):
++    # position [T, 3] (FP64 as the pipeline passes it); power [16] FP32;
++    # cos/sin [T, 48] (the two halves of the [T, 96] cache). One program per
++    # (token block, axis): `block_tokens` positions of one axis and the 16
++    # frequencies of that axis.
++    cos = cos.tile((block_tokens, 16))
++    sin = sin.tile((block_tokens, 16))
++    power = power.tile((16,)).unsqueeze(0).expand(cos.shape)
++    return position.tile((block_tokens, 1)), power, cos, sin
++
++
++def rope_cache_apply(position, power, cos, sin):
++    # minimax_h3_rotary_cache: inv_freq = 1 / power with power = theta **
++    # (arange(0, 32, 2) / 32) (InfiniCore float_power, the same device powf as
++    # PyTorch), angles = position.float() * inv_freq, cat(cos, sin) rounded to
++    # BF16; cos/sin are the same ocml functions as the PyTorch ops.
++    p = power
++    inverse = 1. / p
++    x = position
++    x = x.to(ntl.float32)
++    angle = x * inverse[None, :]
++    cos = libdevice.cos(angle).to(ntl.bfloat16)  # noqa: F841
++    sin = libdevice.sin(angle).to(ntl.bfloat16)  # noqa: F841
++
++
++def make_rope_cache(caller="torch", output_dir=None, archs=None, block_tokens=64, num_warps=4,
++                    dtype=ninetoothed.bfloat16):
++    """H3's 3-axis RoPE table (rope_freq_dim 16): position [T, 3] FP64 and the
++    16 powers theta ** (2k / 32) (FP32) to cos/sin [T, 48] BF16 views (the
++    halves of a [T, 96] cache), bitwise equal to minimax_h3_rotary_cache."""
++    def table():
++        return Tensor(shape=(None, 48), dtype=dtype)
++    return ninetoothed.make(functools.partial(rope_cache_arrange, block_tokens=block_tokens),
++        rope_cache_apply,
++        (Tensor(shape=(None, 3), dtype=ninetoothed.float64), Tensor(shape=(16,), dtype=ninetoothed.float32),
++         table(), table()),
++        caller=caller, output_dir=output_dir, archs=archs,
++        kernel_name="h3_rope_cache", num_warps=num_warps, num_stages=1)
+diff --git a/tools/probe_peer_copy.py b/tools/probe_peer_copy.py
+new file mode 100644
+index 0000000..e2e656b
+--- /dev/null
++++ b/tools/probe_peer_copy.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""Diagnostic: cross-device copy and event semantics on DTK HIP.
++
++Checks, for hipMemcpyAsync(DeviceToDevice) and hipMemcpyPeerAsync between two
++devices:
++  * whether a stream on device A honours hipStreamWaitEvent on an event
++    recorded on device B (copy must land after B's slow writer kernel);
++  * whether the copy is done by a copy engine (no slowdown of a GEMM loop on
++    the source device) or by a compute kernel.
++"""
++import ctypes
++import time
++
++import torch
++
++hip = ctypes.CDLL("libamdhip64.so")
++D2D = 3
++
++
++def check(status, what):
++    if status != 0:
++        raise RuntimeError(f"{what}: HIP error {status}")
++
++
++def event(device):
++    check(hip.hipSetDevice(device), "hipSetDevice")
++    e = ctypes.c_void_p()
++    check(hip.hipEventCreateWithFlags(ctypes.byref(e), 2), "hipEventCreateWithFlags")  # disable timing
++    return e
++
++
++def copy(kind, dst, dst_dev, src, src_dev, nbytes, stream):
++    if kind == "d2d":
++        check(hip.hipMemcpyAsync(ctypes.c_void_p(dst), ctypes.c_void_p(src), ctypes.c_size_t(nbytes),
++                                 D2D, ctypes.c_void_p(stream)), "hipMemcpyAsync")
++    else:
++        check(hip.hipMemcpyPeerAsync(ctypes.c_void_p(dst), dst_dev, ctypes.c_void_p(src), src_dev,
++                                     ctypes.c_size_t(nbytes), ctypes.c_void_p(stream)), "hipMemcpyPeerAsync")
++
++
++def main():
++    a, b = 1, 0
++    for i in (a, b):
++        check(hip.hipSetDevice(i), "hipSetDevice")
++        status = hip.hipDeviceEnablePeerAccess(b if i == a else a, 0)
++        assert status in (0, 704), status
++    n = 64 << 20
++    src = torch.full((n // 2,), 1.0, dtype=torch.bfloat16, device=f"cuda:{a}")
++    dst = torch.zeros((n // 2,), dtype=torch.bfloat16, device=f"cuda:{b}")
++    sa = torch.cuda.Stream(device=a)
++    sb = torch.cuda.Stream(device=b)
++    big = torch.randn(8192, 8192, device=f"cuda:{b}", dtype=torch.bfloat16)
++    for kind in ("d2d", "peer"):
++        ok = 0
++        for trial in range(5):
++            dst.zero_()
++            torch.cuda.synchronize(b)
++            ready = event(b)
++            with torch.cuda.stream(sb):
++                for _ in range(20):            # slow writer on B: ~40+ ms
++                    torch.mm(big, big)
++                dst.fill_(2.0)                 # B writes dst last
++            check(hip.hipEventRecord(ready, ctypes.c_void_p(sb.cuda_stream)), "hipEventRecord")
++            check(hip.hipStreamWaitEvent(ctypes.c_void_p(sa.cuda_stream), ready, 0), "hipStreamWaitEvent")
++            check(hip.hipSetDevice(a), "hipSetDevice")
++            copy(kind, dst.data_ptr(), b, src.data_ptr(), a, n, sa.cuda_stream)
++            torch.cuda.synchronize(a)
++            torch.cuda.synchronize(b)
++            ok += int(bool((dst == 1.0).all()))
++        print(f"{kind}: copy ordered after cross-device event in {ok}/5 trials", flush=True)
++
++    # Copy engine or compute kernel? GEMM loop on the source device with and without copies.
++    m = torch.randn(8192, 8192, device=f"cuda:{a}", dtype=torch.bfloat16)
++    gs = torch.cuda.Stream(device=a)
++
++    def gemms(k):
++        with torch.cuda.stream(gs):
++            for _ in range(k):
++                torch.mm(m, m)
++
++    gemms(2)
++    torch.cuda.synchronize(a)
++    t = time.perf_counter(); gemms(30); torch.cuda.synchronize(a); alone = time.perf_counter() - t
++    for kind in ("d2d", "peer"):
++        torch.cuda.synchronize(a)
++        t = time.perf_counter()
++        for _ in range(20):
++            copy(kind, dst.data_ptr(), b, src.data_ptr(), a, n, sa.cuda_stream)
++        torch.cuda.synchronize(a); torch.cuda.synchronize(b)
++        copies = time.perf_counter() - t
++        t = time.perf_counter()
++        gemms(30)
++        for _ in range(20):
++            copy(kind, dst.data_ptr(), b, src.data_ptr(), a, n, sa.cuda_stream)
++        torch.cuda.synchronize(a); torch.cuda.synchronize(b)
++        both = time.perf_counter() - t
++        print(f"{kind}: gemms {alone:.3f}s, copies {copies:.3f}s ({20 * n / copies / 1e9:.1f} GB/s), both {both:.3f}s",
++              flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/probe_rope_cache.py b/tools/probe_rope_cache.py
+new file mode 100644
+index 0000000..1f3610d
+--- /dev/null
++++ b/tools/probe_rope_cache.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""Diagnostic: NineToothed h3_rope_cache vs the PyTorch minimax_h3_rotary_cache
++(bitwise), on the captured astronaut positions and on synthetic ones."""
++import sys
++
++import torch
++
++from h3_pointwise import make_rope_cache
++
++
++def reference(position_ids, rope_freq_dim=16, rope_theta=10000.0):
++    # Copy of infinilm.multimodal.minimax_h3.minimax_h3_rotary_cache (torch).
++    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, 2 * rope_freq_dim, 2, dtype=torch.float32,
++                                                  device=position_ids.device) / (2 * rope_freq_dim)))
++    frequencies = (position_ids.float().unsqueeze(-1) * inv_freq.view(1, 1, -1)).flatten(1)
++    return torch.cat((frequencies.cos(), frequencies.sin()), dim=-1).to(torch.bfloat16)
++
++
++def power(rope_freq_dim=16, rope_theta=10000.0):
++    # Stand-in for InfiniCore float_power (device powf), as in the reference.
++    exponent = torch.tensor([2 * k / (2 * rope_freq_dim) for k in range(rope_freq_dim)],
++                            dtype=torch.float32, device="cuda")
++    return torch.full_like(exponent, rope_theta) ** exponent
++
++
++def find_positions(obj):
++    if isinstance(obj, dict):
++        if "position_ids" in obj and torch.is_tensor(obj["position_ids"]):
++            return obj["position_ids"]
++        for value in obj.values():
++            found = find_positions(value)
++            if found is not None:
++                return found
++    return None
++
++
++def check(name, kernel, positions):
++    ref = reference(positions)
++    out = torch.empty(positions.shape[0], 96, device="cuda", dtype=torch.bfloat16)
++    kernel(positions.double().contiguous(), power(), out[:, :48], out[:, 48:])
++    torch.cuda.synchronize()
++    mismatch = (out != ref).sum().item()
++    print(f"{name}: dtype {positions.dtype} shape {tuple(positions.shape)} "
++          f"range [{positions.min().item():.4g}, {positions.max().item():.4g}] "
++          f"bitwise {mismatch == 0} mismatches {mismatch}", flush=True)
++    return mismatch == 0
++
++
++def main():
++    kernel = make_rope_cache()
++    ok = True
++    if len(sys.argv) > 1:
++        positions = find_positions(torch.load(sys.argv[1], weights_only=True, map_location="cpu"))
++        ok &= check("captured", kernel, positions.cuda())
++    torch.manual_seed(0)
++    ok &= check("integer", kernel, torch.randint(0, 4096, (50000, 3), device="cuda").float())
++    ok &= check("uniform", kernel, torch.rand(50000, 3, device="cuda") * 2000 - 100)
++    ok &= check("fine", kernel, torch.arange(150000, device="cuda").float().view(-1, 3) / 37)
++    ok &= check("fine64", kernel, torch.arange(150000, device="cuda").double().view(-1, 3) / 37)
++    ok &= check("int64", kernel, torch.randint(-5000, 5000, (50000, 3), device="cuda"))
++    print("ALL_BITWISE" if ok else "MISMATCH")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/probe_triton_arch.py b/tools/probe_triton_arch.py
+new file mode 100644
+index 0000000..c07da6b
+--- /dev/null
++++ b/tools/probe_triton_arch.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""Platform smoke test for a new Hygon architecture: can Triton (and so the
++NineToothed kernels of this tree) compile and run here, and which dtypes does
++the device actually compute with?
++
++It reports the device/arch, then runs, for every dtype that loads at all:
++an elementwise kernel, a reduction, and a `tl.dot` (the matrix path, which on
++gfx906/Z100 has no MFMA instruction and falls back to FMA). Each check prints
++the relative error against the PyTorch result, so an architecture that
++silently computes a dtype badly shows up here rather than inside a fused
++kernel. Diagnostics only; never used by generation.
++"""
++import os
++import sys
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def elementwise_kernel(x, y, out, n, BLOCK: tl.constexpr):
++    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = offsets < n
++    value = tl.load(x + offsets, mask=mask) * tl.load(y + offsets, mask=mask)
++    tl.store(out + offsets, value, mask=mask)
++
++
++@triton.jit
++def reduce_kernel(x, out, width, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    offsets = tl.arange(0, BLOCK)
++    mask = offsets < width
++    value = tl.load(x + row * width + offsets, mask=mask, other=0).to(tl.float32)
++    tl.store(out + row, tl.sum(value, 0))
++
++
++@triton.jit
++def dot_kernel(a, b, c, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    offs_m = tl.program_id(0) * BM + tl.arange(0, BM)
++    offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
++    accumulator = tl.zeros((BM, BN), dtype=tl.float32)
++    for start in range(0, K, BK):
++        offs_k = start + tl.arange(0, BK)
++        left = tl.load(a + offs_m[:, None] * K + offs_k[None, :], mask=offs_m[:, None] < M)
++        right = tl.load(b + offs_k[:, None] * N + offs_n[None, :], mask=offs_n[None, :] < N)
++        accumulator += tl.dot(left, right)
++    tl.store(c + offs_m[:, None] * N + offs_n[None, :], accumulator,
++             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
++
++
++def relative_error(out, reference):
++    reference = reference.float()
++    return ((out.float() - reference).norm() / reference.norm().clamp_min(1e-30)).item()
++
++
++def check(name, fn):
++    try:
++        print(f"  {name:<22} rel err {fn():.3e}", flush=True)
++        return True
++    except Exception as exc:  # noqa: BLE001
++        print(f"  {name:<22} FAILED {type(exc).__name__}: {str(exc)[:140]}", flush=True)
++        return False
++
++
++def main() -> int:
++    if not torch.cuda.is_available():
++        print("no accelerator visible")
++        return 1
++    device = os.environ.get("PROBE_DEVICE", "cuda:0")
++    properties = torch.cuda.get_device_properties(torch.device(device))
++    print(f"device {properties.name}  arch {properties.gcnArchName}  "
++          f"{properties.total_memory / 2**30:.1f} GiB  count {torch.cuda.device_count()}")
++    print(f"torch {torch.__version__}  hip {torch.version.hip}  triton {triton.__version__}")
++    print(f"triton backends {sorted(os.listdir(triton.__path__[0] + '/backends'))}")
++
++    ok = True
++    for name, dtype in (("float32", torch.float32), ("float16", torch.float16),
++                        ("bfloat16", torch.bfloat16)):
++        print(f"{name}:", flush=True)
++        try:
++            x = torch.randn(4096, device=device, dtype=dtype)
++        except Exception as exc:  # noqa: BLE001
++            print(f"  unsupported on this device: {type(exc).__name__}: {exc}")
++            ok = False
++            continue
++        y = torch.randn_like(x)
++
++        def elementwise():
++            out = torch.empty_like(x)
++            elementwise_kernel[(triton.cdiv(x.numel(), 256),)](x, y, out, x.numel(), BLOCK=256)
++            torch.cuda.synchronize()
++            return relative_error(out, x * y)
++
++        rows, width = 64, 512
++        table = torch.randn(rows, width, device=device, dtype=dtype)
++
++        def reduction():
++            out = torch.empty(rows, device=device, dtype=torch.float32)
++            reduce_kernel[(rows,)](table, out, width, BLOCK=width)
++            torch.cuda.synchronize()
++            return relative_error(out, table.float().sum(-1))
++
++        size = 512
++        left = torch.randn(size, size, device=device, dtype=dtype)
++        right = torch.randn(size, size, device=device, dtype=dtype)
++
++        def dot():
++            out = torch.empty(size, size, device=device, dtype=torch.float32)
++            dot_kernel[(size // 64, size // 64)](left, right, out, size, size, size,
++                                                 BM=64, BN=64, BK=32)
++            torch.cuda.synchronize()
++            return relative_error(out, left.float() @ right.float())
++
++        ok &= check("elementwise", elementwise)
++        ok &= check("reduction", reduction)
++        ok &= check("tl.dot", dot)
++    print("ALL_OK" if ok else "SOME_CHECKS_FAILED")
++    return 0 if ok else 2
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/pyspy_pipeline_other.py b/tools/pyspy_pipeline_other.py
+new file mode 100644
+index 0000000..d3eb713
+--- /dev/null
++++ b/tools/pyspy_pipeline_other.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""Diagnostic: from a `py-spy record --format raw` profile of the unified
++entry, attribute main-thread samples inside the generation call that are NOT
++inside a timed component (the entry's ComponentProfiler `timed` wrapper) to
++the pipeline block and leaf function they were spent in."""
++import collections
++import re
++import sys
++
++
++def main():
++    path = sys.argv[1]
++    rate = float(sys.argv[2]) if len(sys.argv) > 2 else 25.0
++    blocks = collections.Counter()
++    leaves = collections.Counter()
++    timed = collections.Counter()
++    total = 0
++    warmup = 0
++    with open(path) as handle:
++        for line in handle:
++            line = line.rstrip()
++            if not line:
++                continue
++            stack, _, count = line.rpartition(" ")
++            count = int(count)
++            frames = stack.split(";")
++            if not any(f.startswith("main (") and "minimax_h3.py" in f for f in frames):
++                continue
++            if not any("modular_pipeline.py" in f and f.startswith("__call__") for f in frames):
++                continue
++            if any(f.startswith("warmup_pipeline (") for f in frames):
++                warmup += count  # the load-time warmup generation, not timed
++                continue
++            total += count
++            timed_index = next((i for i, f in enumerate(frames) if f.startswith("timed (")), None)
++            if timed_index is not None:
++                below = frames[timed_index + 1] if timed_index + 1 < len(frames) else "?"
++                timed[re.sub(r":\d+\)", ")", below)] += count
++                continue
++            block = "?"
++            for f in frames:
++                if "modular_pipelines/minimax_h3/" in f and f.startswith("__call__"):
++                    block = re.sub(r":\d+\)", ")", f)
++            blocks[block] += count
++            leaves[frames[-1]] += count
++    other = total - sum(timed.values())
++    print(f"generation samples {total} ({total / rate:.1f} s), timed {sum(timed.values()) / rate:.1f} s, "
++          f"other {other / rate:.1f} s (warmup generation excluded: {warmup / rate:.1f} s)")
++    print("timed components:")
++    for name, count in timed.most_common(8):
++        print(f"  {count / rate:7.2f} s  {name}")
++    print("other, by pipeline block:")
++    for name, count in blocks.most_common(15):
++        print(f"  {count / rate:7.2f} s  {name}")
++    print("other, by leaf frame:")
++    for name, count in leaves.most_common(25):
++        print(f"  {count / rate:7.2f} s  {name}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/trace_pipeline.py b/tools/trace_pipeline.py
+new file mode 100644
+index 0000000..2a3242f
+--- /dev/null
++++ b/tools/trace_pipeline.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""Diagnostic: run the unified entry (InfiniLM/examples/minimax_h3.py, loaded
++unchanged) and record a hash of the inputs and outputs of every timed
++component call of the generation (condition encoder, VAE encodes, each DiT
++forward, VAE decodes), one JSON line per call. Two runs of the same command
++can then be compared call by call to find where they first differ
++(tools/compare_traces.py). The hashing synchronizes the devices and copies
++tensors to the host, so timings of a traced run are not representative.
++Never used by generation.
++
++usage: trace_pipeline.py OUT.jsonl <minimax_h3.py arguments...>
++"""
++import functools
++import hashlib
++import importlib.util
++import json
++import sys
++from pathlib import Path
++
++import torch
++
++ENTRY = Path(__file__).resolve().parents[1] / "InfiniLM" / "examples" / "minimax_h3.py"
++
++
++def digest(obj, depth=0):
++    if torch.is_tensor(obj):
++        tensor = obj.detach()
++        if tensor.is_cuda:
++            torch.cuda.synchronize(tensor.device)
++        tensor = tensor.contiguous().cpu()
++        if tensor.dtype in (torch.bfloat16, torch.float16):
++            tensor = tensor.view(torch.int16)
++        return f"{list(obj.shape)}:{str(obj.dtype)[6:]}:" + hashlib.sha1(tensor.numpy().tobytes()).hexdigest()[:16]
++    if depth > 3:
++        return None
++    if isinstance(obj, (list, tuple)):
++        return [digest(item, depth + 1) for item in obj]
++    if isinstance(obj, dict):
++        return {str(key): digest(value, depth + 1) for key, value in obj.items()}
++    if hasattr(obj, "__dict__") and not isinstance(obj, torch.nn.Module):
++        found = {name: digest(value, depth + 1) for name, value in vars(obj).items()
++                 if torch.is_tensor(value) or hasattr(value, "__dict__") or isinstance(value, (list, tuple, dict))}
++        return {name: value for name, value in found.items() if value not in (None, [], {})} or None
++    return None
++
++
++def main():
++    out_path = Path(sys.argv[1])
++    sys.argv = [str(ENTRY)] + sys.argv[2:]
++    spec = importlib.util.spec_from_file_location("h3_entry", ENTRY)
++    entry = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = entry  # dataclasses look their module up there
++    spec.loader.exec_module(entry)
++    out = out_path.open("w")
++    counts = {}
++
++    def wrap(owner, method_name, name):
++        original = getattr(owner, method_name)
++
++        @functools.wraps(original)
++        def traced(*args, **kwargs):
++            result = original(*args, **kwargs)
++            index = counts.get(name, 0)
++            counts[name] = index + 1
++            record = {"call": name, "index": index, "args": digest(list(args)),
++                      "kwargs": digest(kwargs), "output": digest(result)}
++            out.write(json.dumps(record) + "\n")
++            out.flush()
++            return result
++
++        setattr(owner, method_name, traced)
++
++    install = entry.install_component_profilers
++
++    def install_traced(report, *, text_encoder, transformer, vae, audio_vae):
++        profiler = install(report, text_encoder=text_encoder, transformer=transformer,
++                           vae=vae, audio_vae=audio_vae)
++        wrap(text_encoder.model, "forward", "condition_encoder")
++        wrap(transformer, "forward", "transformer")
++        wrap(vae, "encode", "video_vae_encode")
++        wrap(audio_vae, "encode", "audio_vae_encode")
++        wrap(vae, "decode", "video_vae_decode")
++        wrap(audio_vae, "decode", "audio_vae_decode")
++        return profiler
++
++    entry.install_component_profilers = install_traced
++    try:
++        entry.main()
++    finally:
++        out.close()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/tune_gemm_lt.py b/tools/tune_gemm_lt.py
+new file mode 100644
+index 0000000..8e36e08
+--- /dev/null
++++ b/tools/tune_gemm_lt.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""Offline tool: build InfiniCore's hipBLASLt choice table from autotune logs.
++
++Run a workload once with INFINICORE_GEMM_LT_AUTOTUNE=1 (and the Lt GEMM path,
++INFINICORE_HYGON_GEMM=lt); InfiniCore then times every heuristic candidate on
++the first call of each GEMM shape and prints
++
++    [infinicore.gemm_lt] <device> <ops> m n k batch lda ldb ldc = <i>  # 0:1.234 1:fail 2:1.100(nondet) ...
++
++This script merges such lines (several ranks / runs may report the same
++shape), keeps candidates that were reproducible in every report, picks the
++lowest mean time, and writes the table read through INFINICORE_GEMM_LT_TABLE.
++Shapes whose best candidate is not at least --min-gain faster than candidate 0
++are left out (they keep the library's first choice).
++"""
++import argparse
++import collections
++import re
++import statistics
++from pathlib import Path
++
++LINE = re.compile(r"\[infinicore\.gemm_lt\] (?P<key>.+?) = (?P<index>-?\d+)\s+#(?P<report>.*)$")
++
++
++def parse(paths):
++    reports = collections.defaultdict(list)
++    for path in paths:
++        for line in Path(path).read_text(errors="replace").splitlines():
++            match = LINE.search(line)
++            if not match:
++                continue
++            times = {}
++            for item in match.group("report").split():
++                index, _, value = item.partition(":")
++                if value == "fail" or value.endswith("(nondet)"):
++                    times[int(index)] = None
++                else:
++                    times[int(index)] = float(value)
++            reports[match.group("key")].append(times)
++    return reports
++
++
++def choose(runs):
++    indices = set.intersection(*(set(times) for times in runs))
++    usable = {i: statistics.mean(times[i] for times in runs) for i in indices
++              if all(times[i] is not None for times in runs)}
++    return usable
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("logs", nargs="+", type=Path)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--min-gain", type=float, default=0.02, help="relative gain over candidate 0 (default 2%%)")
++    args = parser.parse_args()
++    lines = ["# InfiniCore hipBLASLt candidate choices (INFINICORE_GEMM_LT_TABLE); generated by",
++             "# tools/tune_gemm_lt.py from INFINICORE_GEMM_LT_AUTOTUNE=1 logs. Format:",
++             "# <device> <ops> m n k batch lda ldb ldc = <heuristic index>  # timings"]
++    total_before = total_after = 0.0
++    for key, runs in sorted(parse(args.logs).items()):
++        usable = choose(runs)
++        if 0 not in usable:
++            print(f"skip (candidate 0 not reproducible or failed): {key}")
++            continue
++        best = min(usable, key=usable.get)
++        base = usable[0]
++        gain = (base - usable[best]) / base
++        status = "use" if best != 0 and gain >= args.min_gain else "keep 0"
++        print(f"{key}: candidate 0 {base:.3f} ms, best {best} {usable[best]:.3f} ms ({gain:+.1%}) "
++              f"from {len(runs)} report(s) -> {status}")
++        if status == "use":
++            lines.append(f"{key} = {best}  # {base:.3f} -> {usable[best]:.3f} ms ({gain:.1%}), {len(runs)} report(s)")
++            total_before += base
++            total_after += usable[best]
++    args.output.write_text("\n".join(lines) + "\n")
++    if total_before:
++        print(f"tuned shapes: {total_before:.3f} -> {total_after:.3f} ms per call set")
++    print(f"wrote {args.output}")
++
++
++if __name__ == "__main__":
++    main()
