@@ -1,0 +1,63 @@
+{
+  "environment": {
+    "device": "Z200SM_80",
+    "arch": "gfx906:sramecc+:xnack-",
+    "torch": "2.9.0",
+    "hip": "6.3.26093",
+    "triton": "3.8.0",
+    "portable_bf16": true,
+    "caller": "hip",
+    "broadcast_modulation": true,
+    "dtype": "bf16",
+    "seq": 17,
+    "heads": 14,
+    "seed": 1,
+    "repeats": 3,
+    "samples": 1
+  },
+  "results": [
+    {
+      "operator": "rms_modulate",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.3099193374315898,
+      "eager_ms": 3.278346061706543,
+      "kernel_samples_ms": [
+        0.3099193374315898
+      ],
+      "eager_samples_ms": [
+        3.278346061706543
+      ],
+      "speedup": 10.578062307680916,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "gated_residual_rms_modulate",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.3998926480611165,
+      "eager_ms": 3.3680524826049805,
+      "kernel_samples_ms": [
+        0.3998926480611165
+      ],
+      "eager_samples_ms": [
+        3.3680524826049805
+      ],
+      "speedup": 8.422391606684986,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    }
+  ],
+  "diagnostic_only": true
+}

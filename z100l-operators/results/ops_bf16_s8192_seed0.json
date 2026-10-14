@@ -1,0 +1,253 @@
+{
+  "environment": {
+    "device": "Z200SM_80",
+    "arch": "gfx906:sramecc+:xnack-",
+    "torch": "2.9.0",
+    "hip": "6.3.26093",
+    "triton": "3.8.0",
+    "portable_bf16": true,
+    "caller": "hip",
+    "broadcast_modulation": false,
+    "dtype": "bf16",
+    "seq": 8192,
+    "heads": 14,
+    "seed": 0,
+    "repeats": 30,
+    "samples": 5
+  },
+  "results": [
+    {
+      "operator": "qk_norm_rope",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.4574773152669271,
+      "eager_ms": 5.066650899251302,
+      "kernel_samples_ms": [
+        0.46868260701497394,
+        0.45842129389444985,
+        0.4574773152669271,
+        0.455573304494222,
+        0.44212258656819664
+      ],
+      "eager_samples_ms": [
+        5.066650899251302,
+        5.074805196126302,
+        5.196079508463542,
+        5.037205505371094,
+        5.020661417643229
+      ],
+      "speedup": 11.075195928119479,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "rope",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.307322629292806,
+      "eager_ms": 0.38262399037679035,
+      "kernel_samples_ms": [
+        0.3159679412841797,
+        0.307322629292806,
+        0.3052053133646647,
+        0.3110399881998698,
+        0.3048746426900228
+      ],
+      "eager_samples_ms": [
+        0.5572426478068034,
+        0.39055999120076496,
+        0.37957865397135415,
+        0.3795999844868978,
+        0.38262399037679035
+      ],
+      "speedup": 1.245023808553453,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "rope_cache",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.2570026397705078,
+      "eager_ms": 0.22907733917236328,
+      "kernel_samples_ms": [
+        0.268026606241862,
+        0.25572797457377117,
+        0.2570026397705078,
+        0.2575786590576172,
+        0.25614930788675944
+      ],
+      "eager_samples_ms": [
+        0.7030933380126954,
+        0.22964800198872884,
+        0.22766396204630535,
+        0.2285973072052002,
+        0.22907733917236328
+      ],
+      "speedup": 0.8913423588836262,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "rms",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.33620262145996094,
+      "eager_ms": 7.230186971028646,
+      "kernel_samples_ms": [
+        0.3358292579650879,
+        0.3354880015055339,
+        0.3366986274719238,
+        0.3362666447957357,
+        0.33620262145996094
+      ],
+      "eager_samples_ms": [
+        7.244740804036458,
+        7.230186971028646,
+        7.222746276855469,
+        7.2367192586263025,
+        7.221562194824219
+      ],
+      "speedup": 21.50544495944599,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "rms_modulate",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.6257385889689128,
+      "eager_ms": 13.626441446940104,
+      "kernel_samples_ms": [
+        0.6270825068155924,
+        0.6256799062093099,
+        0.6263359069824219,
+        0.6247411727905273,
+        0.6257385889689128
+      ],
+      "eager_samples_ms": [
+        13.626441446940104,
+        13.660996500651041,
+        13.61566874186198,
+        13.64420166015625,
+        13.602313232421874
+      ],
+      "speedup": 21.776572017707345,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "gated_residual",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.6320638656616211,
+      "eager_ms": 0.8025705337524414,
+      "kernel_samples_ms": [
+        0.6337865193684896,
+        0.6320638656616211,
+        0.634298578898112,
+        0.6309172312418619,
+        0.6311625162760417
+      ],
+      "eager_samples_ms": [
+        0.8025705337524414,
+        0.8012212117513021,
+        0.7985811869303385,
+        0.8072586059570312,
+        0.8128691991170247
+      ],
+      "speedup": 1.2697617714822855,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "gated_residual_rms_modulate",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 1.0191998799641928,
+      "eager_ms": 14.435000610351562,
+      "kernel_samples_ms": [
+        1.0196104685465495,
+        1.0194345474243165,
+        1.0188318888346355,
+        1.0182985305786132,
+        1.0191998799641928
+      ],
+      "eager_samples_ms": [
+        14.438205973307292,
+        14.446840413411458,
+        14.413624064127605,
+        14.407091267903645,
+        14.435000610351562
+      ],
+      "speedup": 14.16307134068609,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "swiglu",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 2.570917002360026,
+      "eager_ms": 10.449956258138021,
+      "kernel_samples_ms": [
+        2.570917002360026,
+        2.5710291544596355,
+        2.5712849934895834,
+        2.5693651835123696,
+        2.5706825256347656
+      ],
+      "eager_samples_ms": [
+        10.449614461263021,
+        10.44385986328125,
+        10.45194600423177,
+        10.449956258138021,
+        10.45396728515625
+      ],
+      "speedup": 4.064680520042176,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    }
+  ],
+  "diagnostic_only": true
+}

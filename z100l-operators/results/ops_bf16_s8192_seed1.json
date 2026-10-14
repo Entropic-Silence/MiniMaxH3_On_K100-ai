@@ -1,0 +1,189 @@
+{
+  "environment": {
+    "device": "Z200SM_80",
+    "arch": "gfx906:sramecc+:xnack-",
+    "torch": "2.9.0",
+    "hip": "6.3.26093",
+    "triton": "3.8.0",
+    "portable_bf16": true,
+    "caller": "hip",
+    "broadcast_modulation": false,
+    "dtype": "bf16",
+    "seq": 8192,
+    "heads": 14,
+    "seed": 1,
+    "repeats": 3,
+    "samples": 1
+  },
+  "results": [
+    {
+      "operator": "qk_norm_rope",
+      "options": {},
+      "bitwise_equal": false,
+      "max_abs_difference": 0.015625,
+      "relative_l2": 1.7425360056222416e-05,
+      "finite": true,
+      "kernel_ms": 0.6245326598485311,
+      "eager_ms": 5.481759389241536,
+      "kernel_samples_ms": [
+        0.6245326598485311
+      ],
+      "eager_samples_ms": [
+        5.481759389241536
+      ],
+      "speedup": 8.77737825684094,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "rope",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.3828793366750081,
+      "eager_ms": 2.3685863812764487,
+      "kernel_samples_ms": [
+        0.3828793366750081
+      ],
+      "eager_samples_ms": [
+        2.3685863812764487
+      ],
+      "speedup": 6.186247609614224,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "rope_cache",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.14986600478490195,
+      "eager_ms": 0.6004800001780192,
+      "kernel_samples_ms": [
+        0.14986600478490195
+      ],
+      "eager_samples_ms": [
+        0.6004800001780192
+      ],
+      "speedup": 4.006779262847966,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "rms",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.4144526720046997,
+      "eager_ms": 7.273918787638347,
+      "kernel_samples_ms": [
+        0.4144526720046997
+      ],
+      "eager_samples_ms": [
+        7.273918787638347
+      ],
+      "speedup": 17.55066206342582,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "rms_modulate",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.7152526378631592,
+      "eager_ms": 13.68783696492513,
+      "kernel_samples_ms": [
+        0.7152526378631592
+      ],
+      "eager_samples_ms": [
+        13.68783696492513
+      ],
+      "speedup": 19.13706603839728,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "gated_residual",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 0.7409060001373291,
+      "eager_ms": 0.8669866720835367,
+      "kernel_samples_ms": [
+        0.7409060001373291
+      ],
+      "eager_samples_ms": [
+        0.8669866720835367
+      ],
+      "speedup": 1.1701709419586805,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "gated_residual_rms_modulate",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 1.1380259990692139,
+      "eager_ms": 14.48922348022461,
+      "kernel_samples_ms": [
+        1.1380259990692139
+      ],
+      "eager_samples_ms": [
+        14.48922348022461
+      ],
+      "speedup": 12.731891443671126,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    },
+    {
+      "operator": "swiglu",
+      "options": {},
+      "bitwise_equal": true,
+      "max_abs_difference": 0.0,
+      "relative_l2": 0.0,
+      "finite": true,
+      "kernel_ms": 2.6359456380208335,
+      "eager_ms": 10.510663986206055,
+      "kernel_samples_ms": [
+        2.6359456380208335
+      ],
+      "eager_samples_ms": [
+        10.510663986206055
+      ],
+      "speedup": 3.9874357932881552,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "allclose": true,
+      "correct": true
+    }
+  ],
+  "diagnostic_only": true
+}

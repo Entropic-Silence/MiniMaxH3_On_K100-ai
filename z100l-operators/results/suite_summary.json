@@ -1,0 +1,58 @@
+[
+  {
+    "case": "ops_bf16_s17_seed0",
+    "exit_code": 0,
+    "operators": 8,
+    "correct": 8,
+    "bitwise": 8
+  },
+  {
+    "case": "ops_bf16_s17_seed1",
+    "exit_code": 0,
+    "operators": 8,
+    "correct": 8,
+    "bitwise": 8
+  },
+  {
+    "case": "ops_bf16_s128_seed0",
+    "exit_code": 0,
+    "operators": 8,
+    "correct": 8,
+    "bitwise": 8
+  },
+  {
+    "case": "ops_bf16_s128_seed1",
+    "exit_code": 0,
+    "operators": 8,
+    "correct": 8,
+    "bitwise": 8
+  },
+  {
+    "case": "ops_bf16_s8192_seed0",
+    "exit_code": 0,
+    "operators": 8,
+    "correct": 8,
+    "bitwise": 8
+  },
+  {
+    "case": "ops_bf16_s8192_seed1",
+    "exit_code": 0,
+    "operators": 8,
+    "correct": 8,
+    "bitwise": 7
+  },
+  {
+    "case": "broadcast_bf16_s17_seed1",
+    "exit_code": 0,
+    "operators": 2,
+    "correct": 2,
+    "bitwise": 2
+  },
+  {
+    "case": "broadcast_bf16_s8192_seed0",
+    "exit_code": 0,
+    "operators": 2,
+    "correct": 2,
+    "bitwise": 2
+  }
+]
