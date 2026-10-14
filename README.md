@@ -7,7 +7,7 @@
 在赛题 DTK POD 中：
 
 ```bash
-git clone https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai.git
+git clone --branch z100l-operators https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai.git
 cd MiniMaxH3_On_K100-ai
 bash z100l-operators/scripts/reproduce.sh quick
 bash z100l-operators/scripts/reproduce.sh full

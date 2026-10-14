@@ -56,7 +56,7 @@ BF16、T=8192、seed=0。RMS 隐藏维度 5376，SwiGLU 维度 14336；QK 使用
 
 ## 5. GitHub 与复现
 
-仓库：[Entropic-Silence/MiniMaxH3_On_K100-ai](https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai)。
+提交分支：[z100l-operators](https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai/tree/z100l-operators)。默认分支保留原有内容。
 
 复现源码版本：`bb030a15dfff9dbf48bc6b3573cbb90287905537`。
 
@@ -65,7 +65,7 @@ BF16、T=8192、seed=0。RMS 隐藏维度 5376，SwiGLU 维度 14336；QK 使用
 按照赛题教程进入 DTK POD，在可写目录执行：
 
 ```bash
-git clone https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai.git
+git clone --branch z100l-operators https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai.git
 cd MiniMaxH3_On_K100-ai
 git checkout bb030a15dfff9dbf48bc6b3573cbb90287905537
 bash z100l-operators/scripts/reproduce.sh quick  # 8 类算子快速冒烟
