@@ -16,3 +16,5 @@ bash z100l-operators/scripts/reproduce.sh full
 - `vendor/`：InfiniCore 完整源码归档及其许可证。
 - `results/`、`logs/`：实测证据；新结果输出至 `work/`。
 - `versions.json`、`SHA256SUMS`：环境版本与内容校验。
+
+固定复现源码版本：`bb030a15dfff9dbf48bc6b3573cbb90287905537`；克隆后执行 `git checkout bb030a15dfff9dbf48bc6b3573cbb90287905537`。

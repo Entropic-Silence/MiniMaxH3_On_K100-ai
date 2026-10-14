@@ -28,6 +28,7 @@
 ## 3. 正确性
 
 - InfiniCore 官方 `timestep_embedding` 冒烟：**18/18 通过**。
+- 交付目录的一键快速冒烟已在同一赛题 POD 重跑：**8/8 通过**。
 - 自定义算子：**52/52 通过**，覆盖 8 类算子、T=17/128/8192、随机种子 0/1，以及两类调制融合的零步长广播。
 - 51/52 与 PyTorch 输出逐字节一致。唯一非逐字节一致项为 QK Norm + RoPE（T=8192、seed=1）：最大绝对误差 0.015625，相对 L2 误差 1.7425×10⁻⁵。
 - 判定标准：输出有限，`allclose(atol=0.01, rtol=0.01)`，相对 L2 < 0.005；融合算子的残差输出另行核对逐字节一致。
@@ -57,13 +58,16 @@ BF16、T=8192、seed=0。RMS 隐藏维度 5376，SwiGLU 维度 14336；QK 使用
 
 仓库：[Entropic-Silence/MiniMaxH3_On_K100-ai](https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai)。
 
-本次提交目录：[z100l-operators](https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai/tree/main/z100l-operators)。报告全部性能数据来自本次单卡测试。
+复现源码版本：`bb030a15dfff9dbf48bc6b3573cbb90287905537`。
+
+本次提交目录：[z100l-operators](https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai/tree/bb030a15dfff9dbf48bc6b3573cbb90287905537/z100l-operators)。报告全部性能数据来自本次单卡测试。
 
 按照赛题教程进入 DTK POD，在可写目录执行：
 
 ```bash
 git clone https://github.com/Entropic-Silence/MiniMaxH3_On_K100-ai.git
 cd MiniMaxH3_On_K100-ai
+git checkout bb030a15dfff9dbf48bc6b3573cbb90287905537
 bash z100l-operators/scripts/reproduce.sh quick  # 8 类算子快速冒烟
 bash z100l-operators/scripts/reproduce.sh full   # 52 组正确性与性能复现
 ```

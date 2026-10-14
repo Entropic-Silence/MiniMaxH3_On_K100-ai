@@ -16,3 +16,5 @@ bash z100l-operators/scripts/reproduce.sh full
 本阶段仅开发算子，无 MiniMax-H3 部署或多卡推理结果。型号按 Z100L 归类，运行时枚举 `Z200SM_80`；详细环境与测量条件见报告。
 
 [历史复现说明](docs/历史复现说明.md)
+
+固定复现源码版本：`bb030a15dfff9dbf48bc6b3573cbb90287905537`；克隆后执行 `git checkout bb030a15dfff9dbf48bc6b3573cbb90287905537`。
